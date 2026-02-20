@@ -1,6 +1,7 @@
 # Agent API
 
 Versioned contract: `/contracts/agent/v1/agent.proto`
+Generation config: `/contracts/buf.yaml`, `/contracts/buf.gen.yaml`
 
 ## Transport
 
@@ -35,6 +36,7 @@ Request:
 - `ipv4` string
 - `ipv6` string
 - `owner_uid` int32
+- `action` enum (`CREATE_SYSTEM_USER`, `APPLY_HTTP_VHOST`, `ISSUE_CERTIFICATE`, `APPLY_HTTPS_VHOST`)
 
 Response:
 

@@ -21,12 +21,21 @@ message RunSystemCheckResponse {
   string firewall_status = 5;
 }
 
+enum SiteActivationAction {
+  SITE_ACTIVATION_ACTION_UNSPECIFIED = 0;
+  SITE_ACTIVATION_ACTION_CREATE_SYSTEM_USER = 1;
+  SITE_ACTIVATION_ACTION_APPLY_HTTP_VHOST = 2;
+  SITE_ACTIVATION_ACTION_ISSUE_CERTIFICATE = 3;
+  SITE_ACTIVATION_ACTION_APPLY_HTTPS_VHOST = 4;
+}
+
 message ActivateSiteRequest {
   string site_id = 1;
   string domain = 2;
   string ipv4 = 3;
   string ipv6 = 4;
   int32 owner_uid = 5;
+  SiteActivationAction action = 6;
 }
 
 message ActivateSiteResponse {

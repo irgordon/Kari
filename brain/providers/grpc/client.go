@@ -6,34 +6,68 @@ import (
 	"github.com/kari/brain/internal/domain"
 )
 
+var errActionRejected = errors.New("agent rejected action")
+
 type Client struct {
-	address string
+	transport Transport
 }
 
 func NewClient(address string) Client {
-	return Client{address: address}
+	return Client{transport: NewUnimplementedTransport(address)}
 }
 
-func (c Client) CreateSystemUser(_ domain.Site) error {
-	return c.notImplemented("CreateSystemUser")
+func NewClientWithTransport(transport Transport) Client {
+	return Client{transport: transport}
 }
 
-func (c Client) ApplyHTTPVHost(_ domain.Site) error {
-	return c.notImplemented("ApplyHTTPVHost")
+func (c Client) CreateSystemUser(site domain.Site) error {
+	return c.activateSite(site, ActionCreateSystemUser)
 }
 
-func (c Client) IssueCertificate(_ domain.Site) error {
-	return c.notImplemented("IssueCertificate")
+func (c Client) ApplyHTTPVHost(site domain.Site) error {
+	return c.activateSite(site, ActionApplyHTTPVHost)
 }
 
-func (c Client) ApplyHTTPSVHost(_ domain.Site) error {
-	return c.notImplemented("ApplyHTTPSVHost")
+func (c Client) IssueCertificate(site domain.Site) error {
+	return c.activateSite(site, ActionIssueCertificate)
 }
 
-func (c Client) RunSystemCheck(_ domain.Server) (domain.SystemCheckReport, error) {
-	return domain.SystemCheckReport{}, c.notImplemented("RunSystemCheck")
+func (c Client) ApplyHTTPSVHost(site domain.Site) error {
+	return c.activateSite(site, ActionApplyHTTPSVHost)
 }
 
-func (c Client) notImplemented(method string) error {
-	return errors.New("grpc client method not implemented: " + method + " (address: " + c.address + ")")
+func (c Client) RunSystemCheck(server domain.Server) (domain.SystemCheckReport, error) {
+	response, err := c.transport.RunSystemCheck(RunSystemCheckRequest{ServerID: server.ID})
+	if err != nil {
+		return domain.SystemCheckReport{}, err
+	}
+	return domain.SystemCheckReport{
+		Distro:         response.Distro,
+		Version:        response.Version,
+		Services:       response.Services,
+		FirewallType:   response.FirewallType,
+		FirewallStatus: response.FirewallStatus,
+	}, nil
+}
+
+func (c Client) activateSite(site domain.Site, action SiteActivationAction) error {
+	response, err := c.transport.ActivateSite(mapActivateSiteRequest(site, action))
+	if err != nil {
+		return err
+	}
+	if !response.OK {
+		return errActionRejected
+	}
+	return nil
+}
+
+func mapActivateSiteRequest(site domain.Site, action SiteActivationAction) ActivateSiteRequest {
+	return ActivateSiteRequest{
+		SiteID:   site.ID,
+		Domain:   site.Domain,
+		IPv4:     site.IPv4,
+		IPv6:     site.IPv6,
+		OwnerUID: site.OwnerUID,
+		Action:   action,
+	}
 }

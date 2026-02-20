@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
-pub struct RunSystemCheckRequest {
+pub struct SystemCheckCommand {
     pub server_id: String,
 }
 
 #[derive(Clone, Debug)]
-pub struct RunSystemCheckResponse {
+pub struct SystemCheckResult {
     pub distro: String,
     pub version: String,
     pub services: BTreeMap<String, String>,
@@ -15,7 +15,7 @@ pub struct RunSystemCheckResponse {
 }
 
 #[derive(Clone, Debug)]
-pub struct ActivateSiteRequest {
+pub struct SiteActivationCommand {
     pub site_id: String,
     pub domain: String,
     pub ipv4: String,
@@ -25,7 +25,7 @@ pub struct ActivateSiteRequest {
 }
 
 #[derive(Clone, Debug)]
-pub struct ActivateSiteResponse {
+pub struct SiteActivationResult {
     pub ok: bool,
 }
 
