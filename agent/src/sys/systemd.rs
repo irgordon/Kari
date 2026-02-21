@@ -32,7 +32,7 @@ impl ServiceManager for LinuxSystemdManager {
             env_strings.push_str(&format!("Environment=\"{}={}\"\n", k, v));
         }
 
-        // This template is pure 2026 security.
+        // Systemd template hardened with CGroup quotas and isolation flags
         let unit_content = format!(
             r#"[Unit]
 Description=Kari Managed App: {service_name}
@@ -47,6 +47,13 @@ ExecStart={exec_start}
 {env_block}
 Restart=always
 RestartSec=3
+
+# --- ⚖️ CGroup Resource Limits (Prevent Noisy Neighbors) ---
+CPUAccounting=true
+CPUQuota=100%
+MemoryAccounting=true
+MemoryMax=512M
+TasksMax=512
 
 # --- 🛡️ Kari Ironclad Security Directives ---
 # Prevent the app from gaining new privileges (no sudo escalations)
