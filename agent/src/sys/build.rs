@@ -1,12 +1,15 @@
 // agent/src/sys/build.rs
 
 use crate::sys::traits::BuildManager;
+// Note: Adjusted import to match our previous server.rs refactor
+use crate::server::kari_agent::LogChunk; 
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tonic::Status;
 
 pub struct SystemBuildManager;
 
@@ -18,17 +21,22 @@ impl BuildManager for SystemBuildManager {
         working_dir: &str,
         run_as_user: &str,
         env_vars: &HashMap<String, String>,
-        log_sender: mpsc::Sender<String>,
+        log_tx: mpsc::Sender<Result<LogChunk, Status>>,
     ) -> Result<(), String> {
         
-        // Use `runuser` to drop privileges. 
-        // We pass the build command to `bash -c` but ONLY under the context of the unprivileged user.
+        // 🛡️ 1. Zero-Trust Input Validation
+        if run_as_user.is_empty() || !run_as_user.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err("SECURITY VIOLATION: Invalid username format".into());
+        }
+
+        // 🛡️ 2. Platform Agnostic Shell & Privilege Dropping
+        // We pass the build command to `sh -c` to ensure POSIX compliance across all Linux distros.
         let mut child = Command::new("runuser")
             .arg("-u").arg(run_as_user)
             .arg("--")
-            .arg("bash").arg("-c").arg(build_command)
+            .arg("sh").arg("-c").arg(build_command)
             .current_dir(working_dir)
-            .envs(env_vars) // Inject the app's .env variables safely
+            .envs(env_vars) // Native environment block injection (No shell eval needed)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -37,25 +45,34 @@ impl BuildManager for SystemBuildManager {
         let stdout = child.stdout.take().expect("Failed to open stdout");
         let stderr = child.stderr.take().expect("Failed to open stderr");
 
-        // Stream stdout to the channel
-        let tx_out = log_sender.clone();
-        tokio::spawn(async move {
+        // 🛡️ 3. SLA Backpressure Relief Valve
+        // Using `try_send` drops the chunk if the Go Brain/Svelte UI channel is full,
+        // preventing the `child` process from blocking on full stdout pipes.
+        let tx_out = log_tx.clone();
+        let stdout_task = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                let _ = tx_out.send(format!("[STDOUT] {}\n", line)).await;
+                let chunk = LogChunk { content: format!("[STDOUT] {}\n", line), trace_id: String::new() };
+                let _ = tx_out.try_send(Ok(chunk)); 
             }
         });
 
-        // Stream stderr to the channel
-        let tx_err = log_sender.clone();
-        tokio::spawn(async move {
+        let tx_err = log_tx.clone();
+        let stderr_task = tokio::spawn(async move {
             let mut reader = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                let _ = tx_err.send(format!("[STDERR] {}\n", line)).await;
+                let chunk = LogChunk { content: format!("[STDERR] {}\n", line), trace_id: String::new() };
+                let _ = tx_err.try_send(Ok(chunk));
             }
         });
 
+        // Wait for the binary execution to finish
         let status = child.wait().await.map_err(|e| e.to_string())?;
+
+        // 🛡️ 4. Log Draining Guarantee
+        // We MUST wait for the spawned buffer readers to finish flushing the pipes
+        // before we return and drop the `log_tx` channel.
+        let _ = tokio::join!(stdout_task, stderr_task);
 
         if !status.success() {
             return Err(format!("Build process exited with code: {}", status.code().unwrap_or(-1)));
