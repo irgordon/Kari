@@ -12,57 +12,68 @@ import (
 	"kari/api/internal/core/domain"
 )
 
-// ApplicationRepo implements domain.ApplicationRepository using pgx/v5
 type ApplicationRepo struct {
 	pool *pgxpool.Pool
 }
 
-// NewApplicationRepo is the factory function complying with our DI standards
 func NewApplicationRepo(pool *pgxpool.Pool) domain.ApplicationRepository {
 	return &ApplicationRepo{pool: pool}
 }
 
-// Create inserts a new application with the required app_user identity for the Rust Muscle
+// Create persists the app and the unprivileged OS user identity
 func (r *ApplicationRepo) Create(ctx context.Context, app *domain.Application) error {
-	// 🛡️ SLA Sync: We added app_user to the insert to support Systemd/Jailing logic
 	query := `
 		INSERT INTO applications (domain_id, repo_url, branch, build_command, start_command, env_vars, port, app_user, status)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING id, created_at, updated_at
 	`
-
-	// 🛡️ pgx natively handles map[string]string -> JSONB, no manual Marshal needed.
 	err := r.pool.QueryRow(ctx, query,
-		app.DomainID,
-		app.RepoURL,
-		app.Branch,
-		app.BuildCommand,
-		app.StartCommand,
-		app.EnvVars, 
-		app.Port,
-		app.AppUser, // Required for Rust Agent jail identity
-		app.Status,
+		app.DomainID, app.RepoURL, app.Branch, app.BuildCommand,
+		app.StartCommand, app.EnvVars, app.Port, app.AppUser, app.Status,
 	).Scan(&app.ID, &app.CreatedAt, &app.UpdatedAt)
 
 	if err != nil {
 		return fmt.Errorf("failed to create application: %w", err)
 	}
-
 	return nil
 }
 
-// GetByID fetches an app with strict IDOR protection via domain-ownership join
+// GetByIDWithMetadata performs a 3-way join to support Rank-Based Authorization logic.
+func (r *ApplicationRepo) GetByIDWithMetadata(ctx context.Context, id uuid.UUID) (*domain.ApplicationMetadata, error) {
+	// 🛡️ SLA: Single trip to DB to get everything needed for Authorization
+	query := `
+		SELECT 
+			a.id, a.domain_id, d.domain_name, d.user_id as owner_id, 
+			r.rank as owner_rank
+		FROM applications a
+		JOIN domains d ON a.domain_id = d.id
+		JOIN users u ON d.user_id = u.id
+		JOIN roles r ON u.role_id = r.id
+		WHERE a.id = $1
+	`
+	var meta domain.ApplicationMetadata
+	err := r.pool.QueryRow(ctx, query, id).Scan(
+		&meta.ID, &meta.DomainID, &meta.DomainName, &meta.OwnerID, &meta.OwnerRank,
+	)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to fetch app metadata: %w", err)
+	}
+	return &meta, nil
+}
+
+// GetByID remains for standard UI lookups with strict ownership filtering
 func (r *ApplicationRepo) GetByID(ctx context.Context, id uuid.UUID, userID uuid.UUID) (*domain.Application, error) {
-	// 🛡️ Zero-Trust: Joined on domains.user_id to ensure the requester owns the resource
 	query := `
 		SELECT a.id, a.domain_id, a.repo_url, a.branch, a.build_command, a.start_command, a.env_vars, a.port, a.app_user, a.status, a.created_at, a.updated_at
 		FROM applications a
 		INNER JOIN domains d ON a.domain_id = d.id
 		WHERE a.id = $1 AND d.user_id = $2
 	`
-
-	// pgx.RowToStructByName automatically maps the columns to the struct fields.
-	// This reduces the scan-list maintenance burden as the domain model grows.
+	// Using pgx.CollectOneRow with RowToStructByName for cleaner mapping
 	rows, err := r.pool.Query(ctx, query, id, userID)
 	if err != nil {
 		return nil, err
@@ -72,10 +83,23 @@ func (r *ApplicationRepo) GetByID(ctx context.Context, id uuid.UUID, userID uuid
 	app, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[domain.Application])
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, domain.ErrNotFound 
+			return nil, domain.ErrNotFound
 		}
-		return nil, fmt.Errorf("failed to get application: %w", err)
+		return nil, err
+	}
+	return &app, nil
+}
+
+// Delete removes the application record. The Service layer handles the Muscle cleanup first.
+func (r *ApplicationRepo) Delete(ctx context.Context, id uuid.UUID) error {
+	query := `DELETE FROM applications WHERE id = $1`
+	tag, err := r.pool.Exec(ctx, query, id)
+	if err != nil {
+		return fmt.Errorf("failed to delete application: %w", err)
 	}
 
-	return &app, nil
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
 }
