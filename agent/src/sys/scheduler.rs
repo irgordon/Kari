@@ -2,6 +2,7 @@
 
 use crate::sys::traits::{JobIntent, JobScheduler};
 use async_trait::async_trait;
+use std::os::unix::fs::PermissionsExt;
 use tokio::fs;
 use tokio::process::Command;
 
@@ -22,13 +23,31 @@ impl SystemdTimerManager {
 #[async_trait]
 impl JobScheduler for SystemdTimerManager {
     async fn schedule_job(&self, intent: &JobIntent) -> Result<(), String> {
+        
+        // 🛡️ 1. Zero-Trust Path Traversal Shield
+        if intent.name.is_empty() || !intent.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err("SECURITY VIOLATION: Invalid job name format".into());
+        }
+
+        // 🛡️ 2. Directive Injection Prevention
+        if intent.schedule.contains('\n') || intent.schedule.contains('=') {
+            return Err("SECURITY VIOLATION: Invalid characters in schedule".into());
+        }
+
         let service_name = format!("kari-job-{}", intent.name);
         let service_path = format!("{}/{}.service", self.systemd_dir, service_name);
         let timer_path = format!("{}/{}.timer", self.systemd_dir, service_name);
 
-        // 1. Generate the Execution Unit (.service)
-        // Notice Type=oneshot: This tells systemd the process will exit when done,
-        // preventing systemd from constantly trying to "restart" it like a web server.
+        // 🛡️ 3. SLA Trait Compliance (Anti-Injection Construction)
+        // We iterate through the discrete arguments and safely quote them for systemd parsing,
+        // completely avoiding raw string execution.
+        let mut exec_start = intent.binary.clone();
+        for arg in &intent.args {
+            let safe_arg = arg.replace('"', "\\\"");
+            exec_start.push_str(&format!(" \"{}\"", safe_arg));
+        }
+
+        // Generate the Execution Unit (.service)
         let service_content = format!(
             r#"[Unit]
 Description=Kari Scheduled Job: {job_name}
@@ -38,7 +57,7 @@ After=network.target
 Type=oneshot
 User={user}
 Group={user}
-ExecStart={command}
+ExecStart={exec_start}
 
 # --- 🛡️ Kari Ironclad Security Directives ---
 NoNewPrivileges=true
@@ -49,21 +68,17 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 "#,
             job_name = intent.name,
-            user = intent.user,
-            command = intent.command
+            user = intent.run_as_user, // Satisfies the new trait contract
+            exec_start = exec_start
         );
 
-        // 2. Generate the Scheduling Unit (.timer)
-        // Modern systemd (230+) natively accepts standard CRON expressions 
-        // in the OnCalendar directive, making our SLA perfectly backwards-compatible.
+        // Generate the Scheduling Unit (.timer)
         let timer_content = format!(
             r#"[Unit]
 Description=Kari Timer for {job_name}
 
 [Timer]
 OnCalendar={schedule}
-# If the server is down when the timer is supposed to fire, 
-# trigger it immediately upon boot.
 Persistent=true
 AccuracySec=1s
 
@@ -74,7 +89,7 @@ WantedBy=timers.target
             schedule = intent.schedule
         );
 
-        // 3. Write files safely to disk (using injected configuration paths)
+        // Write files safely to disk
         fs::write(&service_path, service_content)
             .await
             .map_err(|e| format!("Failed to write service file: {}", e))?;
@@ -83,17 +98,17 @@ WantedBy=timers.target
             .await
             .map_err(|e| format!("Failed to write timer file: {}", e))?;
 
-        // 4. Lock permissions to root
+        // 🛡️ 4. Native Kernel Syscalls (No `chmod` subprocess)
         for path in [&service_path, &timer_path] {
-            let chmod_out = Command::new("chmod")
-                .args(["644", path])
-                .output()
+            let mut perms = fs::metadata(path)
                 .await
-                .map_err(|e| format!("Failed to execute chmod: {}", e))?;
-
-            if !chmod_out.status.success() {
-                return Err(format!("Failed to secure permissions for {}", path));
-            }
+                .map_err(|e| format!("Failed to read metadata for {}: {}", path, e))?
+                .permissions();
+            
+            perms.set_mode(0o644);
+            fs::set_permissions(path, perms)
+                .await
+                .map_err(|e| format!("Failed to secure permissions for {}: {}", path, e))?;
         }
 
         // 5. Reload daemon to recognize the new files
@@ -116,7 +131,8 @@ WantedBy=timers.target
             .map_err(|e| format!("Failed to enable timer: {}", e))?;
 
         if !enable_out.status.success() {
-            return Err(format!("Failed to activate timer {}", timer_name));
+            let stderr = String::from_utf8_lossy(&enable_out.stderr);
+            return Err(format!("Failed to activate timer {}: {}", timer_name, stderr));
         }
 
         Ok(())
