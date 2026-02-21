@@ -1,21 +1,25 @@
 services:
   # ============================================================================
-  # 🗄️ Database: PostgreSQL 16
+  # 🗄️ Database: PostgreSQL 16 (Hardened)
   # ============================================================================
   db:
     image: postgres:16-alpine
     container_name: kari-db
     environment:
       POSTGRES_USER: kari_admin
-      POSTGRES_PASSWORD: dev_password_only
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-dev_password_only}
       POSTGRES_DB: kari
-    ports:
-      - "5432:5432"
+    # 🛡️ Removed public ports: No direct DB access from host for security
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./api/internal/db/migrations:/docker-entrypoint-initdb.d
     networks:
-      - kari-internal
+      - backplane
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kari_admin -d kari"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   # ============================================================================
   # ⚙️ The Muscle: Rust Agent
@@ -25,15 +29,18 @@ services:
       context: .
       dockerfile: agent/Dockerfile.dev
     container_name: kari-agent
-    privileged: true # Required to simulate systemd/jailing logic locally
+    privileged: true 
     volumes:
-      # The Shared Socket: This is the SLA boundary
       - kari_run:/var/run/kari
-      # Simulated OS paths for Nginx/SSL testing
       - ./dev_root/etc/nginx:/etc/nginx
       - ./dev_root/etc/kari/ssl:/etc/kari/ssl
     networks:
-      - kari-internal
+      - backplane
+    # 🛡️ Resource Limits to prevent build process from OOMing the host
+    deploy:
+      resources:
+        limits:
+          memory: 1G
 
   # ============================================================================
   # 🧠 The Brain: Go API
@@ -44,20 +51,22 @@ services:
       dockerfile: api/Dockerfile.dev
     container_name: kari-api
     depends_on:
-      - db
-      - agent
+      db:
+        condition: service_healthy # 🛡️ Wait for DB to be READY, not just started
+      agent:
+        condition: service_started
     environment:
-      DATABASE_URL: postgres://kari_admin:dev_password_only@db:5432/kari?sslmode=disable
-      JWT_SECRET: dev_secret_for_testing_only
+      DATABASE_URL: postgres://kari_admin:${DB_PASSWORD:-dev_password_only}@db:5432/kari?sslmode=disable
+      JWT_SECRET: ${JWT_SECRET:-dev_secret_for_testing_only}
       PORT: "8080"
-      # Platform Agnostic: Go points to the shared socket path
       AGENT_SOCKET: /var/run/kari/agent.sock
     ports:
       - "8080:8080"
     volumes:
       - kari_run:/var/run/kari
     networks:
-      - kari-internal
+      - backplane
+      - frontend-net
 
   # ============================================================================
   # 💻 The UI: SvelteKit
@@ -68,17 +77,23 @@ services:
       dockerfile: Dockerfile.dev
     container_name: kari-ui
     environment:
-      VITE_API_URL: http://localhost:8080
+      # 🛡️ SLA: Distinguish between internal and external API calls
+      INTERNAL_API_URL: http://api:8080
+      PUBLIC_API_URL: http://localhost:8080
     ports:
       - "5173:5173"
     networks:
-      - kari-internal
+      - frontend-net
+    depends_on:
+      - api
 
 networks:
-  kari-internal:
+  # 🛡️ Zero-Trust Segregation
+  backplane:
+    internal: true # 🛡️ No internet access for DB and Agent
+  frontend-net:
     driver: bridge
 
 volumes:
   postgres_data:
-  # This volume facilitates the gRPC communication over Unix Sockets
   kari_run:
