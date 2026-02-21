@@ -161,3 +161,52 @@ kari/
 │   └── install.sh                      # Production bash installer
 ├── docker-compose.yml                  # Local PostgreSQL
 └── README.md
+```
+---
+
+## 12. The gRPC Contract (The Source of Truth)
+
+The communication between the Go Brain and the Rust Muscle is governed by strict Protobuf definitions located in `/proto`. This is where the **Single Layer Abstraction (SLA)** is enforced at the network level.
+
+### 12.1. Abstract Intent Patterns
+
+Rather than sending raw shell commands, the Go Brain sends **Intents**.
+
+* **`FirewallIntent`:** Instead of `iptables -A...`, the API sends a list of ports and allowed CIDRs. The Rust Agent translates this into the host's native firewall (UFW, NFTables, or Firewalld).
+* **`DeploymentIntent`:** Includes the Git URL, the target unprivileged user, and the build instructions. Rust handles the privilege dropping and directory sandboxing.
+
+### 12.2. Streaming Build Logs
+
+The gRPC contract utilizes **Server-Side Streaming** for real-time observability:
+
+```protobuf
+service SystemAgent {
+  // Streams stdout/stderr from the build process directly to the Brain
+  rpc StreamDeployment(DeploymentRequest) returns (stream LogChunk);
+}
+
+```
+
+This allows the Svelte UI to render logs line-by-line without polling, maintaining an exceptionally low-latency GitOps experience.
+
+---
+
+## 13. Memory-Bound Secret Management
+
+To satisfy the highest tier of security compliance, Karı implements a **Volatile-Only Private Key** lifecycle.
+
+1. **Transport:** TLS private keys are passed as `bytes` over the Unix socket.
+2. **Rust Acquisition:** The Agent receives the bytes and immediately wraps them in a `ProviderCredential` struct.
+3. **The Secret Closure:** Utilizing the `secrecy` crate, the bytes are only exposed inside a restricted closure for the duration of the synchronous `std::fs::write` operation.
+4. **Zeroization:** The second the write is complete, the `Drop` trait is invoked, physically overwriting the memory address with zeros (`0x00`) to prevent cold-boot or memory-dump exploits.
+
+---
+
+## 14. Observability & Action Center Logic
+
+The **Action Center** is powered by a proactive background watcher in the Go Brain.
+
+1. **Health Checkers:** Periodic Go routines ping internal app ports and check disk space.
+2. **Alert Escalation:** If an app is down or an SSL renewal fails, the `AuditService` creates a `system_alert` with a `CRITICAL` severity.
+3. **UI Propagation:** The SvelteKit dashboard reacts to these alerts, forcing them to the top of the admin's view via the **Action Center Widget**, ensuring technical debt and system failures are addressed immediately.
+
