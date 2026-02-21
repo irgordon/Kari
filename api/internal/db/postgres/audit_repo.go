@@ -4,16 +4,14 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"kari/api/internal/core/domain"
 )
-
-// ==============================================================================
-// 1. Repository Struct
-// ==============================================================================
 
 type AuditRepository struct {
 	pool *pgxpool.Pool
@@ -24,125 +22,77 @@ func NewAuditRepository(pool *pgxpool.Pool) *AuditRepository {
 }
 
 // ==============================================================================
-// 2. Tenant Audit Logging (User-Facing Actions)
+// Dynamic Action Center Querying
 // ==============================================================================
 
 /**
- * LogActivity records a specific action taken by a user within a tenant context.
- * This satisfies the SLA for non-repudiation.
+ * GetFilteredAlerts builds a dynamic SQL query based on UI filters.
+ * This ensures that as the Karı UI grows, the data layer remains flexible
+ * without needing dozens of hardcoded "GetByStatus" methods.
  */
-func (r *AuditRepository) LogActivity(ctx context.Context, entry domain.AuditEntry) error {
-	query := `
-		INSERT INTO tenant_logs (
-			id, tenant_id, user_id, action, resource_type, resource_id, metadata, ip_address, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-	`
-	_, err := r.pool.Exec(ctx, query,
-		uuid.New(),
-		entry.TenantID,
-		entry.UserID,
-		entry.Action,
-		entry.ResourceType,
-		entry.ResourceID,
-		entry.Metadata, // Stored as JSONB for platform flexibility
-		entry.IPAddress,
-		time.Now().UTC(),
-	)
-	return err
-}
+func (r *AuditRepository) GetFilteredAlerts(ctx context.Context, filter domain.AlertFilter) ([]domain.SystemAlert, error) {
+	// 1. Base query focusing on actionable infrastructure health
+	query := `SELECT id, severity, category, resource_id, message, is_resolved, created_at 
+	          FROM system_alerts WHERE 1=1`
+	
+	var args []any
+	argCount := 1
 
-// ==============================================================================
-// 3. System Alerting (Infrastructure Health)
-// ==============================================================================
+	// 2. Dynamic filter building (Open/Closed Principle)
+	// We append conditions dynamically without modifying the base logic
+	if filter.IsResolved != nil {
+		query += fmt.Sprintf(" AND is_resolved = $%d", argCount)
+		args = append(args, *filter.IsResolved)
+		argCount++
+	}
 
-/**
- * CreateAlert generates a proactive system notification.
- * These are the records surfaced in the "Action Center" UI widget.
- */
-func (r *AuditRepository) CreateAlert(ctx context.Context, alert domain.SystemAlert) error {
-	query := `
-		INSERT INTO system_alerts (
-			id, severity, category, resource_id, message, error_details, is_resolved, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`
-	_, err := r.pool.Exec(ctx, query,
-		uuid.New(),
-		alert.Severity,
-		alert.Category,
-		alert.ResourceID,
-		alert.Message,
-		alert.ErrorDetails,
-		false,
-		time.Now().UTC(),
-	)
-	return err
-}
+	if filter.Severity != "" {
+		query += fmt.Sprintf(" AND severity = $%d", argCount)
+		args = append(args, filter.Severity)
+		argCount++
+	}
 
-/**
- * GetUnresolvedAlerts fetches proactive notifications for the Action Center.
- * Implements strict data filtering to ensure only high-priority health data is returned.
- */
-func (r *AuditRepository) GetUnresolvedAlerts(ctx context.Context) ([]domain.SystemAlert, error) {
-	query := `
-		SELECT id, severity, category, resource_id, message, created_at
-		FROM system_alerts
-		WHERE is_resolved = false
-		ORDER BY created_at DESC
-	`
-	rows, err := r.pool.Query(ctx, query)
+	if filter.Category != "" {
+		query += fmt.Sprintf(" AND category = $%d", argCount)
+		args = append(args, filter.Category)
+		argCount++
+	}
+
+	// 3. Finalize ordering (Latest issues first)
+	query += " ORDER BY created_at DESC"
+
+	// 4. Execution with strict Context (SLA Compliance)
+	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch filtered alerts: %w", err)
 	}
 	defer rows.Close()
 
-	var alerts []domain.SystemAlert
-	for rows.Next() {
-		var a domain.SystemAlert
-		if err := rows.Scan(&a.ID, &a.Severity, &a.Category, &a.ResourceID, &a.Message, &a.CreatedAt); err != nil {
-			return nil, err
-		}
-		alerts = append(alerts, a)
-	}
-	return alerts, nil
+	return pgx.CollectRows(rows, pgx.RowToStructByName[domain.SystemAlert])
 }
 
+// ==============================================================================
+// Atomic Alert Resolution
+// ==============================================================================
+
 /**
- * ResolveAlert marks a system issue as addressed, clearing it from the UI.
+ * ResolveAlert handles the transition of an alert from active to resolved.
+ * We use an atomic UPDATE to ensure consistency across the distributed Brain.
  */
 func (r *AuditRepository) ResolveAlert(ctx context.Context, alertID uuid.UUID) error {
-	query := `UPDATE system_alerts SET is_resolved = true, resolved_at = $1 WHERE id = $2`
-	_, err := r.pool.Exec(ctx, query, time.Now().UTC(), alertID)
-	return err
-}
-
-// ==============================================================================
-// 4. Platform-Agnostic Querying (SLA)
-// ==============================================================================
-
-/**
- * GetTenantLogs provides paginated, filtered access to audit history.
- */
-func (r *AuditRepository) GetTenantLogs(ctx context.Context, tenantID uuid.UUID, limit, offset int) ([]domain.AuditEntry, error) {
 	query := `
-		SELECT id, user_id, action, resource_type, resource_id, metadata, created_at
-		FROM tenant_logs
-		WHERE tenant_id = $1
-		ORDER BY created_at DESC
-		LIMIT $2 OFFSET $3
+		UPDATE system_alerts 
+		SET is_resolved = true, resolved_at = $1 
+		WHERE id = $2 AND is_resolved = false
 	`
-	rows, err := r.pool.Query(ctx, query, tenantID, limit, offset)
+	tag, err := r.pool.Exec(ctx, query, time.Now().UTC(), alertID)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	defer rows.Close()
 
-	var logs []domain.AuditEntry
-	for rows.Next() {
-		var l domain.AuditEntry
-		if err := rows.Scan(&l.ID, &l.UserID, &l.Action, &l.ResourceType, &l.ResourceID, &l.Metadata, &l.CreatedAt); err != nil {
-			return nil, err
-		}
-		logs = append(logs, l)
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("alert not found or already resolved")
 	}
-	return logs, nil
+
+	return nil
 }
