@@ -2,9 +2,8 @@
     import { onMount, onDestroy } from 'svelte';
     import { Terminal } from 'xterm';
     import { FitAddon } from 'xterm-addon-fit';
-    import { TerminalStreamService, type LogChunk } from '$lib/api/terminalStream';
     
-    // xterm.js requires its core CSS to render the canvas/DOM grid correctly
+    // xterm.css is required for the canvas grid to render correctly
     import 'xterm/css/xterm.css';
 
     // Props
@@ -14,82 +13,87 @@
     let terminalElement: HTMLDivElement;
     let terminal: Terminal;
     let fitAddon: FitAddon;
-    let streamService: TerminalStreamService;
+    let eventSource: EventSource | null = null;
     
     let status: 'connecting' | 'streaming' | 'completed' | 'error' = 'connecting';
 
+    // 🛡️ Zero-Trust: Validate the traceId format before connecting
+    const isValidTraceId = (id: string) => /^[a-f0-9-]{36}$/i.test(id) || id.length > 5;
+
     onMount(() => {
-        // 1. Initialize the xterm.js instance with our Brand Colors
+        if (!isValidTraceId(traceId)) {
+            status = 'error';
+            return;
+        }
+
+        // 1. Initialize xterm.js with Kari Panel Brand Palette
         terminal = new Terminal({
             fontFamily: '"IBM Plex Mono", monospace',
             fontSize: 13,
             lineHeight: 1.4,
             cursorBlink: true,
-            disableStdin: true, // This is a read-only log stream
+            disableStdin: true,
             theme: {
-                // Invert the palette for the terminal: Dark background, Light text
-                background: '#1A1A1C',       // Brand Text Color as the dark background
-                foreground: '#F4F5F6',       // Brand Light Gray as text
-                cursor: '#1BA8A0',           // Brand Primary Teal
-                selectionBackground: 'rgba(27, 168, 160, 0.3)', // Translucent Teal
-                // ANSI Color Overrides to make standard logs look beautiful
-                cyan: '#1BA8A0',             // Map ANSI cyan to our Brand Teal
-                green: '#10B981',            // Success green
-                red: '#EF4444',              // Error red
-                yellow: '#F59E0B',           // Warning yellow
+                background: '#1A1A1C',   // Brand Deep Gray
+                foreground: '#F4F5F6',   // Brand Light Gray
+                cursor: '#1BA8A0',       // Brand Teal
+                selectionBackground: 'rgba(27, 168, 160, 0.3)',
+                cyan: '#1BA8A0',
+                green: '#10B981',
+                red: '#EF4444',
+                yellow: '#F59E0B',
             }
         });
 
-        // 2. Attach the FitAddon so the terminal dynamically resizes to our flex container
         fitAddon = new FitAddon();
         terminal.loadAddon(fitAddon);
         terminal.open(terminalElement);
         fitAddon.fit();
 
-        // Handle window resizing without relying on global window events
-        const resizeObserver = new ResizeObserver(() => {
-            fitAddon.fit();
-        });
+        // 🛡️ SLA: Ensure UI responsiveness on container resize
+        const resizeObserver = new ResizeObserver(() => fitAddon.fit());
         resizeObserver.observe(terminalElement);
 
-        // 3. Initialize the WebSocket SLA Service
-        streamService = new TerminalStreamService(traceId, {
-            onOpen: () => {
-                status = 'streaming';
-                terminal.clear();
-                terminal.writeln('\x1b[36m[Karı]\x1b[0m Connection established. Awaiting build logs...');
-            },
-            onMessage: (chunk: LogChunk) => {
-                // Write the raw payload directly to xterm. 
-                // xterm natively parses \r\n and ANSI color codes (\x1b[31m).
-                terminal.write(chunk.message);
-                
-                if (chunk.is_eof) {
-                    status = 'completed';
-                    terminal.writeln('\r\n\x1b[36m[Karı]\x1b[0m Deployment pipeline finished.');
-                }
-            },
-            onError: (err) => {
-                status = 'error';
-                console.error('Terminal stream error:', err);
-            },
-            onClose: (code, reason, wasClean) => {
-                if (status !== 'completed') {
-                    status = 'error';
-                }
+        // 2. 📡 Connect to the Go Brain SSE Endpoint
+        // Standard SSE automatically handles reconnections (SLA reliability)
+        const url = `/api/deployments/${traceId}/logs/stream`;
+        eventSource = new EventSource(url);
+
+        terminal.writeln('\x1b[36m[Karı]\x1b[0m Establishing encrypted telemetry link...');
+
+        eventSource.onopen = () => {
+            status = 'streaming';
+            terminal.writeln('\x1b[32m[Karı]\x1b[0m Link active. Streaming from Muscle Agent...\r\n');
+        };
+
+        eventSource.onmessage = (event) => {
+            // Write the raw payload directly. xterm parses ANSI and \n.
+            terminal.write(event.data);
+            
+            // 🛡️ SLA: Detect EOF signaled by our Go Worker
+            if (event.data.includes("✅ Deployment successful") || event.data.includes("❌ ERROR")) {
+                status = event.data.includes("✅") ? 'completed' : 'error';
+                terminal.writeln('\r\n\x1b[36m[Karı]\x1b[0m Stream closed by host.');
             }
-        });
+        };
 
-        // 4. Connect to the Go API
-        streamService.connect();
+        eventSource.onerror = (err) => {
+            if (status !== 'completed') {
+                status = 'error';
+                terminal.writeln('\r\n\x1b[31m[Karı]\x1b[0m Telemetry link severed unexpectedly.');
+            }
+            eventSource?.close();
+        };
 
-        // Cleanup observer on unmount
-        return () => resizeObserver.disconnect();
+        return () => {
+            resizeObserver.disconnect();
+            if (eventSource) eventSource.close();
+            if (terminal) terminal.dispose();
+        };
     });
 
     onDestroy(() => {
-        // Prevent memory leaks by severing the WebSocket and destroying the xterm canvas
-        if (streamService) streamService.disconnect();
+        if (eventSource) eventSource.close();
         if (terminal) terminal.dispose();
     });
 </script>
@@ -102,7 +106,7 @@
             </svg>
             <h3 class="font-sans font-semibold text-sm text-kari-text">Deployment Logs</h3>
             <span class="text-xs font-mono text-kari-warm-gray bg-kari-warm-gray/10 px-2 py-0.5 rounded">
-                {traceId.split('-')[0]} 
+                {traceId.slice(0, 8)} 
             </span>
         </div>
 
@@ -115,16 +119,16 @@
                 <span class="text-xs font-medium text-kari-warm-gray">Connecting...</span>
             {:else if status === 'streaming'}
                 <span class="relative flex h-2.5 w-2.5">
-                  <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-kari-teal opacity-75"></span>
-                  <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-kari-teal"></span>
+                  <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#1BA8A0] opacity-75"></span>
+                  <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-[#1BA8A0]"></span>
                 </span>
-                <span class="text-xs font-medium text-kari-teal">Live</span>
+                <span class="text-xs font-medium text-[#1BA8A0]">Live Telemetry</span>
             {:else if status === 'completed'}
                 <span class="h-2.5 w-2.5 rounded-full bg-green-500"></span>
-                <span class="text-xs font-medium text-kari-text">Completed</span>
+                <span class="text-xs font-medium text-kari-text">Sync Finished</span>
             {:else if status === 'error'}
                 <span class="h-2.5 w-2.5 rounded-full bg-red-500"></span>
-                <span class="text-xs font-medium text-red-600">Connection Lost</span>
+                <span class="text-xs font-medium text-red-600">Offline</span>
             {/if}
         </div>
     </div>
@@ -135,8 +139,9 @@
 </div>
 
 <style>
+    /* 🛡️ Custom Scrollbar Styling for xterm */
     :global(.xterm-viewport::-webkit-scrollbar) { width: 8px; }
     :global(.xterm-viewport::-webkit-scrollbar-track) { background: #1A1A1C; }
-    :global(.xterm-viewport::-webkit-scrollbar-thumb) { background: #8E8F93; border-radius: 4px; }
+    :global(.xterm-viewport::-webkit-scrollbar-thumb) { background: #3F3F46; border-radius: 4px; }
     :global(.xterm-viewport::-webkit-scrollbar-thumb:hover) { background: #1BA8A0; }
 </style>
