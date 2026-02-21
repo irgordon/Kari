@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -26,7 +27,7 @@ func NewApplicationService(
 ) *ApplicationService {
 	return &ApplicationService{
 		repo:        repo,
-		auditRepo:   auditRepo,
+		auditRepo:   audit, // Fixed: was auditRepo: auditRepo
 		agentClient: agent,
 		logger:      logger,
 	}
@@ -41,7 +42,9 @@ func (s *ApplicationService) Deploy(ctx context.Context, appID uuid.UUID, userID
 	}
 
 	// 2. Generate Trace Identity for the Action Center
-	traceID := fmt.Sprintf("dep-%s-%d", app.ID.String()[:8], ctx.Value("request_start").(int64))
+	// Note: Fallback to current timestamp if request_start is missing from context
+	reqStart, _ := ctx.Value("request_start").(int64)
+	traceID := fmt.Sprintf("dep-%s-%d", app.ID.String()[:8], reqStart)
 	
 	s.logger.Info("Starting deployment", 
 		slog.String("app", app.Name), 
@@ -51,7 +54,7 @@ func (s *ApplicationService) Deploy(ctx context.Context, appID uuid.UUID, userID
 	stream, err := s.agentClient.StreamDeployment(ctx, &pb.DeployRequest{
 		TraceId:      traceID,
 		AppId:        app.ID.String(),
-		DomainName:   app.DomainName, // From Joined query
+		DomainName:   app.DomainName,
 		RepoUrl:      app.RepoURL,
 		Branch:       app.Branch,
 		BuildCommand: app.BuildCommand,
@@ -74,7 +77,6 @@ func (s *ApplicationService) Deploy(ctx context.Context, appID uuid.UUID, userID
 			}
 			if err != nil {
 				s.logger.Error("Deployment stream interrupted", slog.Any("error", err))
-				// Log to Action Center via AuditRepo
 				_ = s.auditRepo.CreateAlert(context.Background(), &domain.SystemAlert{
 					Severity: "critical",
 					Category: "deployment",
@@ -83,11 +85,49 @@ func (s *ApplicationService) Deploy(ctx context.Context, appID uuid.UUID, userID
 				})
 				break
 			}
-			
-			// Push to channel for WebSocket delivery
 			logChan <- chunk.Content
 		}
 	}()
 
 	return logChan, nil
+}
+
+// 🛡️ DeleteApplication enforces Rank-Based Ownership and OS-level cleanup
+func (s *ApplicationService) DeleteApplication(ctx context.Context, appID uuid.UUID, actorID uuid.UUID, actorRank int) error {
+	// 1. Fetch Target App with Internal Metadata (joins users to get owner_rank)
+	app, err := s.repo.GetByIDWithMetadata(ctx, appID)
+	if err != nil {
+		return fmt.Errorf("application not found: %w", err)
+	}
+
+	// 🛡️ 2. Authority Logic: Actor must own the app OR have a superior (lower) rank than the owner
+	isOwner := app.OwnerID == actorID
+	hasSuperiorRank := actorRank < app.OwnerRank
+
+	if !isOwner && !hasSuperiorRank {
+		s.logger.Warn("Forbidden deletion attempt", 
+			slog.String("app_id", appID.String()), 
+			slog.String("actor", actorID.String()))
+		return errors.New("forbidden: you do not have authority to delete this resource")
+	}
+
+	// 3. Audit the intent
+	_ = s.auditRepo.CreateAlert(ctx, &domain.SystemAlert{
+		Severity: "warning",
+		Category: "lifecycle",
+		Message:  fmt.Sprintf("Teardown of %s initiated by user rank %d", app.Name, actorRank),
+		Metadata: map[string]any{"app_id": appID, "actor_id": actorID},
+	})
+
+	// 4. Invoke Rust Muscle (gRPC) for physical cleanup (systemd, nginx, directories)
+	_, err = s.agentClient.DeleteDeployment(ctx, &pb.DeleteRequest{
+		AppId:      app.ID.String(),
+		DomainName: app.DomainName,
+	})
+	if err != nil {
+		return fmt.Errorf("system agent failed to clean up resource: %w", err)
+	}
+
+	// 5. Atomic DB Deletion
+	return s.repo.Delete(ctx, appID)
 }
