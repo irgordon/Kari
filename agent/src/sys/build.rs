@@ -7,6 +7,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tonic::Status;
+use tracing::{info, warn, error};
 
 pub struct SystemBuildManager;
 
@@ -19,40 +20,41 @@ impl BuildManager for SystemBuildManager {
         run_as_user: &str,
         env_vars: &HashMap<String, String>,
         log_tx: mpsc::Sender<Result<LogChunk, Status>>,
-        trace_id: String, // 🛡️ SLA: Passed from server.rs for correlation
+        trace_id: String, 
     ) -> Result<(), String> {
         
-        // 🛡️ 1. Zero-Trust Validation
+        // 🛡️ 1. Identity Validation
         if run_as_user.is_empty() || !run_as_user.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return Err("SECURITY VIOLATION: Invalid username format".into());
+            return Err("SECURITY VIOLATION: Suspicious username format".into());
         }
 
-        // 🛡️ 2. Automatic Cleanup
-        // kill_on_drop(true) ensures the build process terminates if the gRPC context is cancelled.
-        let mut cmd = Command::new("runuser");
-        cmd.arg("-u").arg(run_as_user)
-           .arg("--")
-           .arg("sh").arg("-c").arg(build_command)
-           .current_dir(working_dir)
-           .envs(env_vars)
-           .stdout(Stdio::piped())
-           .stderr(Stdio::piped())
-           .kill_on_drop(true); 
+        // 🛡️ 2. Sandbox Execution
+        // Using `runuser` ensures a clean environment drop.
+        // `kill_on_drop` is our primary safety net for the Go Brain's context cancellation.
+        let mut child = Command::new("runuser")
+            .arg("-u").arg(run_as_user)
+            .arg("--")
+            .arg("sh").arg("-c").arg(build_command)
+            .current_dir(working_dir)
+            .envs(env_vars)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true) 
+            .spawn()
+            .map_err(|e| format!("Failed to initiate build process: {}", e))?;
 
-        let mut child = cmd.spawn()
-            .map_err(|e| format!("SLA Failure: Build spawn error: {}", e))?;
+        let stdout = child.stdout.take().ok_or("STDOUT_UNAVAILABLE")?;
+        let stderr = child.stderr.take().ok_or("STDERR_UNAVAILABLE")?;
 
-        let stdout = child.stdout.take().ok_or("Failed to open stdout")?;
-        let stderr = child.stderr.take().ok_or("Failed to open stderr")?;
-
-        // 🛡️ 3. Structured Telemetry Tasks
+        // 🛡️ 3. Concurrent Telemetry Tasks
+        // We use .send().await to respect gRPC backpressure.
         let t_out = trace_id.clone();
         let tx_out = log_tx.clone();
         let stdout_task = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                let chunk = LogChunk { content: format!("{}\n", line), trace_id: t_out.clone() };
-                // Using await here respects backpressure; try_send would drop lines.
+                let msg = format!("[OUT] {}\n", line);
+                let chunk = LogChunk { content: msg, trace_id: t_out.clone() };
                 if tx_out.send(Ok(chunk)).await.is_err() { break; } 
             }
         });
@@ -62,19 +64,24 @@ impl BuildManager for SystemBuildManager {
         let stderr_task = tokio::spawn(async move {
             let mut reader = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                let chunk = LogChunk { content: format!("ERR: {}\n", line), trace_id: t_err.clone() };
+                let msg = format!("[ERR] {}\n", line);
+                let chunk = LogChunk { content: msg, trace_id: t_err.clone() };
                 if tx_err.send(Ok(chunk)).await.is_err() { break; }
             }
         });
 
-        // 4. Synchronization
+        // 4. Lifecycle Synchronization
         let status = child.wait().await.map_err(|e| e.to_string())?;
         
-        // Ensure all logs are flushed before returning
+        // Ensure all log buffers are flushed before returning control to server.rs
         let _ = tokio::join!(stdout_task, stderr_task);
 
         if !status.success() {
-            return Err(format!("Build exited with status: {}", status));
+            let exit_desc = match status.code() {
+                Some(code) => format!("Exit Code: {}", code),
+                None => "Terminated by Signal (OOM/Abort)".to_string(),
+            };
+            return Err(format!("Build process failed: {}", exit_desc));
         }
 
         Ok(())
