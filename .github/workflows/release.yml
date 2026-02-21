@@ -7,11 +7,11 @@ on:
 
 permissions:
   contents: write
-  packages: write # 🛡️ SLA: Needed if we decide to push Docker images to GHCR later
+  packages: write # 🛡️ SLA: Required to push Docker images to GHCR
 
 jobs:
   # ============================================================================
-  # ⚙️ Build Rust Agent (The Muscle)
+  # ⚙️ Build Rust Agent (Bare-Metal Binaries)
   # ============================================================================
   build-agent:
     name: Build Rust Agent (${{ matrix.target }})
@@ -38,19 +38,16 @@ jobs:
             agent/target/
           key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
-      # 🛡️ Stability: Use 'cross' for seamless C-dependency cross-compilation
       - name: Install Cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build Production Binary
         run: |
           cd agent
-          # cross automatically pulls the right Docker container with OpenSSL and musl toolchains configured
           cross build --release --target ${{ matrix.target }}
 
       - name: Rename Artifact
-        run: |
-          mv agent/target/${{ matrix.target }}/release/kari-agent ./kari-agent-${{ matrix.target }}
+        run: mv agent/target/${{ matrix.target }}/release/kari-agent ./kari-agent-${{ matrix.target }}
         
       - uses: actions/upload-artifact@v4
         with:
@@ -58,7 +55,7 @@ jobs:
           path: ./kari-agent-${{ matrix.target }}
 
   # ============================================================================
-  # 🧠 Build Go API (The Brain)
+  # 🧠 Build Go API (Bare-Metal Binaries)
   # ============================================================================
   build-api:
     name: Build Go API
@@ -74,8 +71,6 @@ jobs:
       - name: Build Static Binary
         run: |
           cd api
-          # 🛡️ Zero-Trust: CGO_ENABLED=0 ensures no dynamic linking vulnerabilities
-          # 🛡️ Performance: -s -w strips debug symbols, shrinking the binary
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ../kari-api-amd64 ./cmd/kari-api/main.go
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o ../kari-api-arm64 ./cmd/kari-api/main.go
 
@@ -85,11 +80,63 @@ jobs:
           path: ./kari-api-*
 
   # ============================================================================
+  # 🐳 Build & Push Docker Images to GHCR
+  # ============================================================================
+  build-docker:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # We dynamically build the 3 core containers from their respective directories
+        component: [api, frontend, agent]
+    steps:
+      - uses: actions/checkout@v4
+
+      # 🛡️ Agnosticism: Enable multi-architecture builds (AMD64 & ARM64)
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # 🛡️ Performance: Buildx allows aggressive layer caching
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 🛡️ Zero-Trust: Authenticate using the ephemeral GitHub token
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/kari-${{ matrix.component }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !github.event.release.prerelease }}
+
+      - name: Build and Push Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./${{ matrix.component }}
+          file: ./${{ matrix.component }}/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          # 🛡️ Performance: Instruct GitHub Actions to cache Docker layers externally
+          cache-from: type=gha,scope=kari-${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=kari-${{ matrix.component }}
+
+  # ============================================================================
   # 🚀 Create GitHub Release
   # ============================================================================
   create-release:
     name: Create Release and Upload Assets
-    needs: [build-agent, build-api]
+    needs: [build-agent, build-api, build-docker]
     runs-on: ubuntu-latest
     steps:
       - name: Download All Artifacts
@@ -99,8 +146,6 @@ jobs:
 
       - name: Prepare Files for Release
         run: |
-          # actions/download-artifact drops files into subdirectories based on artifact names.
-          # We move them to the root so the release has a flat, clean file list.
           mv artifacts/kari-agent-*/* .
           mv artifacts/kari-api-binaries/* .
 
