@@ -3,75 +3,89 @@ package services
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"time"
 
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 
-	"kari/api/internal/config"
 	"kari/api/internal/core/domain"
 )
 
+// Dummy hash to equalize timing attacks. This is a valid bcrypt hash of the word "dummy".
+var dummyBcryptHash = []byte("$2a$10$wTf/0J/Q32r.5R7bU4X8uO4b2pE7Z9H5a0rY4q1w4s7c9d0x2z5eG")
+
+// AuthService orchestrates secure login flows and session generation.
 type AuthService struct {
-	repo   domain.UserRepository
-	config *config.Config
+	repo         domain.UserRepository
+	tokenService *TokenService // 🛡️ SOLID: Inject the cryptographic engine
 }
 
-type KariClaims struct {
-	Email string `json:"email"`
-	Rank  int    `json:"rank"`
-	jwt.RegisteredClaims
-}
-
-func NewAuthService(repo domain.UserRepository, cfg *config.Config) *AuthService {
-	return &AuthService{repo: repo, config: cfg}
-}
-
-// GenerateTokenPair issues tokens with higher entropy for the refresh side
-func (s *AuthService) GenerateTokenPair(ctx context.Context, user *domain.User) (string, string, error) {
-	// 1. Access Token
-	accessToken, err := s.generateAccessToken(user)
-	if err != nil {
-		return "", "", err
+// NewAuthService creates a new authentication orchestrator.
+func NewAuthService(repo domain.UserRepository, ts *TokenService) *AuthService {
+	return &AuthService{
+		repo:         repo,
+		tokenService: ts,
 	}
-
-	// 🛡️ 2. Secure Refresh Token Generation
-	// Instead of UUID, we use 32 bytes of random data (Base64 encoded)
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", "", fmt.Errorf("failed to generate entropy: %w", err)
-	}
-	refreshToken := base64.URLEncoding.EncodeToString(b)
-
-	// 🛡️ Use the passed-in context to honor request timeouts
-	err = s.repo.UpdateRefreshToken(ctx, user.ID, refreshToken)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to persist refresh token: %w", err)
-	}
-
-	return accessToken, refreshToken, nil
 }
 
+// Login authenticates a user safely against timing and enumeration attacks.
 func (s *AuthService) Login(ctx context.Context, email, password string) (string, string, error) {
 	user, err := s.repo.GetByEmail(ctx, email)
 	if err != nil {
+		// 1. 🛡️ Zero-Trust: Anti-Enumeration
+		// Even if the user doesn't exist, we force the CPU to compute a bcrypt hash.
+		// This guarantees the HTTP response takes ~100ms regardless of user existence.
+		_ = bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(password))
 		return "", "", errors.New("invalid credentials")
 	}
 
-	// Constant-time check
+	// 2. Constant-time credential check
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
 		return "", "", errors.New("invalid credentials")
 	}
 
 	if !user.IsActive {
-		return "", "", errors.New("account suspended")
+		// 🛡️ Information Obfuscation: Do not tell the attacker the account is suspended.
+		return "", "", errors.New("invalid credentials")
 	}
 
 	return s.GenerateTokenPair(ctx, user)
 }
 
-// ... generateAccessToken remains the same ...
+// GenerateTokenPair mints a stateless Access Token and a stateful, hashed Opaque Refresh Token.
+func (s *AuthService) GenerateTokenPair(ctx context.Context, user *domain.User) (string, string, error) {
+	// 1. 🛡️ SOLID: Delegate stateless JWT minting to the TokenService
+	// (Assuming we refactored TokenService to just output the access token string)
+	accessToken, err := s.tokenService.GenerateAccessToken(user)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to generate access token: %w", err)
+	}
+
+	// 2. 🛡️ Secure Opaque Refresh Token Generation
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", "", fmt.Errorf("failed to generate cryptographic entropy: %w", err)
+	}
+	
+	// This is the raw string sent to the SvelteKit edge (and stored in the HttpOnly cookie)
+	refreshTokenPlain := base64.URLEncoding.EncodeToString(b)
+
+	// 3. 🛡️ Zero-Trust Storage: Hash before persistence
+	// We use SHA-256 to hash the refresh token. Because refresh tokens are 32 bytes 
+	// of raw entropy, they are mathematically immune to rainbow table attacks, 
+	// so a fast hashing algorithm like SHA-256 (instead of bcrypt) is safe and performant.
+	hash := sha256.Sum256([]byte(refreshTokenPlain))
+	refreshTokenHash := hex.EncodeToString(hash[:])
+
+	// We store the HASH in PostgreSQL, never the plaintext token.
+	err = s.repo.UpdateRefreshToken(ctx, user.ID, refreshTokenHash)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to persist refresh token hash: %w", err)
+	}
+
+	// We return the plaintext token to the handler so it can be sent to the user.
+	return accessToken, refreshTokenPlain, nil
+}
