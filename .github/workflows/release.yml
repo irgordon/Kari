@@ -1,0 +1,122 @@
+name: Karı Release Pipeline
+
+on:
+  push:
+    tags:
+      - 'v*' # Trigger on version tags like v1.0.0
+
+permissions:
+  contents: write
+
+jobs:
+  # ============================================================================
+  # ⚙️ Build Rust Agent (The Muscle)
+  # ============================================================================
+  build-agent:
+    name: Build Rust Agent (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Protoc
+        run: sudo apt-get install -y protobuf-compiler
+
+      - name: Install Cross-Compilation Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
+
+      - name: Cache Cargo Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            agent/target/
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build Production Binary
+        run: |
+          cd agent
+          # Use cross-compilation settings if target is ARM64
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+          fi
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename and Upload Artifact
+        run: |
+          mv agent/target/${{ matrix.target }}/release/kari-agent ./kari-agent-${{ matrix.target }}
+        
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kari-agent-${{ matrix.target }}
+          path: ./kari-agent-${{ matrix.target }}
+
+  # ============================================================================
+  # 🧠 Build Go API (The Brain)
+  # ============================================================================
+  build-api:
+    name: Build Go API
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install Protoc
+        run: sudo apt-get install -y protobuf-compiler
+
+      - name: Install Go Protoc Plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+
+      - name: Build Static Binary
+        run: |
+          cd api
+          # CGO_ENABLED=0 ensures a fully static binary that runs on any Linux distro
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ../kari-api-amd64 ./cmd/kari-api/main.go
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o ../kari-api-arm64 ./cmd/kari-api/main.go
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kari-api-binaries
+          path: ./kari-api-*
+
+  # ============================================================================
+  # 🚀 Create GitHub Release
+  # ============================================================================
+  create-release:
+    name: Create Release and Upload Assets
+    needs: [build-agent, build-api]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            kari-agent-*/kari-agent-*
+            kari-api-binaries/kari-api-*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
