@@ -1,86 +1,80 @@
+// api/internal/db/postgres/application_repo.go
 package postgres
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"kari/api/internal/core/domain"
 )
 
-// ApplicationRepo implements domain.ApplicationRepository for PostgreSQL
+// ApplicationRepo implements domain.ApplicationRepository using pgx/v5
 type ApplicationRepo struct {
-	DB *sql.DB // The injected connection pool
+	pool *pgxpool.Pool
 }
 
-// NewApplicationRepo is the factory function
-func NewApplicationRepo(db *sql.DB) domain.ApplicationRepository {
-	return &ApplicationRepo{DB: db}
+// NewApplicationRepo is the factory function complying with our DI standards
+func NewApplicationRepo(pool *pgxpool.Pool) domain.ApplicationRepository {
+	return &ApplicationRepo{pool: pool}
 }
 
-// Create inserts a new application and scans the generated UUID and Timestamps back into the struct
+// Create inserts a new application with the required app_user identity for the Rust Muscle
 func (r *ApplicationRepo) Create(ctx context.Context, app *domain.Application) error {
+	// 🛡️ SLA Sync: We added app_user to the insert to support Systemd/Jailing logic
 	query := `
-		INSERT INTO applications (domain_id, app_type, repo_url, branch, build_command, start_command, env_vars, port)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		RETURNING id, status, created_at, updated_at
+		INSERT INTO applications (domain_id, repo_url, branch, build_command, start_command, env_vars, port, app_user, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		RETURNING id, created_at, updated_at
 	`
 
-	// Convert the Go map into a JSON byte array for Postgres JSONB
-	envVarsJSON, err := json.Marshal(app.EnvVars)
-	if err != nil {
-		return err
-	}
-
-	// Execute the query and map the database-generated defaults (UUID, timestamps) back to the pointer
-	err = r.DB.QueryRowContext(ctx, query,
+	// 🛡️ pgx natively handles map[string]string -> JSONB, no manual Marshal needed.
+	err := r.pool.QueryRow(ctx, query,
 		app.DomainID,
-		app.AppType,
 		app.RepoURL,
 		app.Branch,
 		app.BuildCommand,
 		app.StartCommand,
-		envVarsJSON,
+		app.EnvVars, 
 		app.Port,
-	).Scan(&app.ID, &app.Status, &app.CreatedAt, &app.UpdatedAt)
+		app.AppUser, // Required for Rust Agent jail identity
+		app.Status,
+	).Scan(&app.ID, &app.CreatedAt, &app.UpdatedAt)
 
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to create application: %w", err)
+	}
+
+	return nil
 }
 
-// GetByID fetches an application, ensuring the Tenant actually owns the associated domain
+// GetByID fetches an app with strict IDOR protection via domain-ownership join
 func (r *ApplicationRepo) GetByID(ctx context.Context, id uuid.UUID, userID uuid.UUID) (*domain.Application, error) {
-	// We do an INNER JOIN on domains to enforce tenant isolation at the database level.
-	// This physically prevents IDOR attacks.
+	// 🛡️ Zero-Trust: Joined on domains.user_id to ensure the requester owns the resource
 	query := `
-		SELECT a.id, a.domain_id, a.app_type, a.repo_url, a.branch, a.build_command, a.start_command, a.env_vars, a.port, a.status, a.created_at, a.updated_at
+		SELECT a.id, a.domain_id, a.repo_url, a.branch, a.build_command, a.start_command, a.env_vars, a.port, a.app_user, a.status, a.created_at, a.updated_at
 		FROM applications a
 		INNER JOIN domains d ON a.domain_id = d.id
 		WHERE a.id = $1 AND d.user_id = $2
 	`
 
-	var app domain.Application
-	var envVarsJSON []byte
-
-	err := r.DB.QueryRowContext(ctx, query, id, userID).Scan(
-		&app.ID, &app.DomainID, &app.AppType, &app.RepoURL, &app.Branch,
-		&app.BuildCommand, &app.StartCommand, &envVarsJSON, &app.Port,
-		&app.Status, &app.CreatedAt, &app.UpdatedAt,
-	)
-
+	// pgx.RowToStructByName automatically maps the columns to the struct fields.
+	// This reduces the scan-list maintenance burden as the domain model grows.
+	rows, err := r.pool.Query(ctx, query, id, userID)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, domain.ErrNotFound // Return a domain-specific error, not a SQL error
-		}
 		return nil, err
 	}
+	defer rows.Close()
 
-	// Unmarshal the JSONB back into the Go map
-	if len(envVarsJSON) > 0 {
-		if err := json.Unmarshal(envVarsJSON, &app.EnvVars); err != nil {
-			return nil, err
+	app, err := pgx.CollectOneRow(rows, pgx.RowToStructByName[domain.Application])
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrNotFound 
 		}
+		return nil, fmt.Errorf("failed to get application: %w", err)
 	}
 
 	return &app, nil
