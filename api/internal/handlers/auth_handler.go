@@ -2,106 +2,108 @@ package handlers
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"time"
 
-	"kari/api/internal/core/domain"
 	"kari/api/internal/core/services"
 )
 
+// LoginRequest defines the expected shape of the inbound authentication payload.
+type LoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// AuthHandler bridges the HTTP edge and the core authentication logic.
 type AuthHandler struct {
-	tokenService *services.TokenService
-	userRepo     domain.UserRepository // To fetch fresh data during rotation
+	authService *services.AuthService
 }
 
-func NewAuthHandler(ts *services.TokenService, ur domain.UserRepository) *AuthHandler {
+// NewAuthHandler injects the required business logic orchestrator.
+func NewAuthHandler(authService *services.AuthService) *AuthHandler {
 	return &AuthHandler{
-		tokenService: ts,
-		userRepo:     ur,
+		authService: authService,
 	}
 }
 
-// Refresh handles the Silent Refresh flow
-func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
-	// 1. Extract the Refresh Cookie
-	cookie, err := r.Cookie("kari_refresh_token")
+// Login handles POST /api/v1/auth/login
+func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
+	// 1. 🛡️ Anti-DOS: Cap payload size at 10KB to prevent memory exhaustion
+	r.Body = http.MaxBytesReader(w, r.Body, 10240)
+
+	var req LoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	// 2. Orchestrate business logic (which includes our timing-attack defenses)
+	accessToken, refreshToken, err := h.authService.Login(r.Context(), req.Email, req.Password)
 	if err != nil {
-		http.Error(w, `{"message": "No refresh token provided"}`, http.StatusUnauthorized)
+		// 🛡️ Information Obfuscation: Generic 401 prevents enumeration
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
 
-	// 2. 🛡️ Cryptographic Verification
-	userID, err := h.tokenService.VerifyRefreshToken(cookie.Value)
-	if err != nil {
-		// If the refresh token is expired or tampered with, clear the dead cookie
-		h.clearCookies(w)
-		http.Error(w, `{"message": "Session expired, please log in again"}`, http.StatusUnauthorized)
-		return
-	}
+	// 3. 🛡️ Zero-Trust Network Boundary: Bake the cookies
+	h.setSecureCookies(w, accessToken, refreshToken)
 
-	// 3. 🛡️ SLA: Fetch Fresh State
-	// We MUST hit the database here. If an admin revoked this user's access
-	// 5 minutes ago, this stops them from getting a new 15-minute access token.
-	user, err := h.userRepo.FindByID(r.Context(), userID)
-	if err != nil || !user.IsActive {
-		h.clearCookies(w)
-		http.Error(w, `{"message": "Account suspended or not found"}`, http.StatusUnauthorized)
-		return
-	}
-
-	// 4. Generate New Token Pair (Token Rotation)
-	newAccess, newRefresh, err := h.tokenService.GenerateTokenPair(user)
-	if err != nil {
-		http.Error(w, `{"message": "Failed to generate session"}`, http.StatusInternalServerError)
-		return
-	}
-
-	// 5. Securely set the new cookies
-	h.setAuthCookies(w, newAccess, newRefresh)
-
-	// Return a 200 OK so SvelteKit knows it can proceed
+	// Return a clean 200 OK. Notice we DO NOT return the tokens in the JSON body.
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "refreshed"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "authenticated"})
 }
 
-// 🛡️ Helper: Apply Zero-Trust cookie policies
-func (h *AuthHandler) setAuthCookies(w http.ResponseWriter, accessToken, refreshToken string) {
+// Logout handles POST /api/v1/auth/logout
+func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
+	// 1. 🛡️ State Destruction: Overwrite the cookies with immediate expiration
+	http.SetCookie(w, &http.Cookie{
+		Name:     "kari_access_token",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   -1, // Instructs browser to delete immediately
+		Expires:  time.Unix(0, 0),
+	})
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "kari_refresh_token",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+	})
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// setSecureCookies applies strict browser security policies to the session tokens.
+func (h *AuthHandler) setSecureCookies(w http.ResponseWriter, accessToken, refreshToken string) {
+	// 🛡️ Access Token (Short-lived, contains RBAC state)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "kari_access_token",
 		Value:    accessToken,
 		Path:     "/",
-		HttpOnly: true,
-		Secure:   true, // Requires HTTPS in production
-		SameSite: http.SameSiteStrictMode,
-		MaxAge:   int(15 * time.Minute.Seconds()), 
+		HttpOnly: true,                  // 🛡️ XSS Protection: JS cannot read this
+		Secure:   true,                  // 🛡️ MITM Protection: Only sent over HTTPS
+		SameSite: http.SameSiteStrictMode, // 🛡️ CSRF Protection: Never sent cross-origin
+		MaxAge:   15 * 60,               // 15 Minutes
 	})
 
+	// 🛡️ Refresh Token (Long-lived, opaque database pointer)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "kari_refresh_token",
 		Value:    refreshToken,
-		Path:     "/api/v1/auth/refresh", // 🛡️ SLA: Only send this cookie to the refresh endpoint!
+		Path:     "/",
 		HttpOnly: true,
 		Secure:   true,
 		SameSite: http.SameSiteStrictMode,
-		MaxAge:   int(7 * 24 * time.Hour.Seconds()), 
-	})
-}
-
-// 🛡️ Helper: Clean up cookies on failure
-func (h *AuthHandler) clearCookies(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     "kari_access_token",
-		Value:    "",
-		Path:     "/",
-		HttpOnly: true,
-		MaxAge:   -1,
-	})
-	http.SetCookie(w, &http.Cookie{
-		Name:     "kari_refresh_token",
-		Value:    "",
-		Path:     "/api/v1/auth/refresh",
-		HttpOnly: true,
-		MaxAge:   -1,
+		MaxAge:   7 * 24 * 60 * 60,      // 7 Days
 	})
 }
