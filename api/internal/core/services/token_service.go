@@ -6,10 +6,11 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	
 	"kari/api/internal/core/domain"
 )
 
-// KariClaims holds the stateless authorization data
+// KariClaims holds the stateless authorization data.
 type KariClaims struct {
 	Rank        string   `json:"rank,omitempty"`
 	Permissions []string `json:"permissions,omitempty"`
@@ -18,16 +19,22 @@ type KariClaims struct {
 	jwt.RegisteredClaims
 }
 
+// TokenService orchestrates cryptographic identity for the Brain.
 type TokenService struct {
 	secret []byte
 }
 
+// NewTokenService creates a new symmetric-key token service.
 func NewTokenService(secret string) *TokenService {
 	return &TokenService{secret: []byte(secret)}
 }
 
-// GenerateTokenPair mints both the short-lived access token and the long-lived refresh token
+// GenerateTokenPair mints both the short-lived access token and the long-lived refresh token.
 func (s *TokenService) GenerateTokenPair(user *domain.User) (string, string, error) {
+	now := time.Now()
+	// 🛡️ Stability: 5-second clock skew allowance for distributed systems
+	nbf := jwt.NewNumericDate(now.Add(-5 * time.Second)) 
+
 	// 1. 🛡️ Mint Access Token (15 Minutes) - Contains full RBAC data
 	accessClaims := KariClaims{
 		Rank:        user.Rank,
@@ -36,8 +43,9 @@ func (s *TokenService) GenerateTokenPair(user *domain.User) (string, string, err
 		TokenType:   "access",
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   user.ID.String(),
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(15 * time.Minute)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(now.Add(15 * time.Minute)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: nbf,
 			Issuer:    "kari-brain",
 		},
 	}
@@ -47,15 +55,16 @@ func (s *TokenService) GenerateTokenPair(user *domain.User) (string, string, err
 		return "", "", fmt.Errorf("failed to sign access token: %w", err)
 	}
 
-	// 2. 🛡️ Mint Refresh Token (7 Days) - Only contains the Subject ID
+	// 2. 🛡️ Mint Refresh Token (7 Days) - Stripped down, purely for session renewal
 	refreshClaims := KariClaims{
 		TokenType: "refresh",
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   user.ID.String(),
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(7 * 24 * time.Hour)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(now.Add(7 * 24 * time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: nbf,
 			Issuer:    "kari-brain",
-			ID:        uuid.New().String(), // JTI for potential database revocation tracking
+			ID:        uuid.New().String(), // JTI for potential database revocation
 		},
 	}
 	refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims)
@@ -67,33 +76,34 @@ func (s *TokenService) GenerateTokenPair(user *domain.User) (string, string, err
 	return signedAccess, signedRefresh, nil
 }
 
-// VerifyRefreshToken validates the signature, expiry, and token type
+// VerifyRefreshToken validates the signature, expiry, algorithm, issuer, and token type.
 func (s *TokenService) VerifyRefreshToken(tokenString string) (uuid.UUID, error) {
+	// 🛡️ Zero-Trust: We utilize v5's parser options to strictly enforce cryptographic boundaries
 	token, err := jwt.ParseWithClaims(tokenString, &KariClaims{}, func(token *jwt.Token) (interface{}, error) {
-		// 🛡️ Zero-Trust: Force the signing method check
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
 		return s.secret, nil
-	})
+	}, 
+		jwt.WithValidMethods([]string{"HS256"}), // Explicitly reject HS512, none, RS256, etc.
+		jwt.WithIssuer("kari-brain"),            // Explicitly reject tokens minted by other services
+		jwt.WithExpirationRequired(),            // Reject tokens missing the 'exp' claim
+	)
 
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("invalid token signature or expired: %w", err)
+		return uuid.Nil, fmt.Errorf("invalid token signature, expired, or failed claim validation: %w", err)
 	}
 
 	claims, ok := token.Claims.(*KariClaims)
 	if !ok || !token.Valid {
-		return uuid.Nil, fmt.Errorf("invalid token claims")
+		return uuid.Nil, fmt.Errorf("invalid token claims structure")
 	}
 
 	// 🛡️ Explicitly prevent an Access token from being used as a Refresh token
 	if claims.TokenType != "refresh" {
-		return uuid.Nil, fmt.Errorf("invalid token type: expected refresh")
+		return uuid.Nil, fmt.Errorf("invalid token type: expected refresh, got %s", claims.TokenType)
 	}
 
 	userID, err := uuid.Parse(claims.Subject)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("malformed subject claim")
+		return uuid.Nil, fmt.Errorf("malformed subject claim: not a valid UUID")
 	}
 
 	return userID, nil
