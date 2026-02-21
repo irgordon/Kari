@@ -59,6 +59,17 @@ func EnforceTLS(next http.Handler) http.Handler {
 	})
 }
 
+// MaxBytes limits the size of the incoming request body to prevent OOM DoS attacks.
+func MaxBytes(limit int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Sever the connection if the body exceeds the limit (e.g., 1MB)
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // ==============================================================================
 // 3. Identity & Access Management (IAM)
 // ==============================================================================
