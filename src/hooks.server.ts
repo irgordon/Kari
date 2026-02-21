@@ -1,69 +1,57 @@
-// src/hooks.server.ts
 import type { Handle } from '@sveltejs/kit';
-import { jwtDecode } from 'jwt-decode';
-
-interface KariJwtPayload {
-    sub: string;
-    role: 'admin' | 'tenant';
-    exp: number;
-}
+import * as jose from 'jose'; // 🛡️ Use jose for server-side verification
+import { env } from '$env/dynamic/private';
 
 export const handle: Handle = async ({ event, resolve }) => {
-    let accessToken = event.cookies.get('kari_access_token');
-    const refreshToken = event.cookies.get('kari_refresh_token');
+	// 🛡️ Performance: Skip auth logic for static assets or internal SvelteKit calls
+	if (event.url.pathname.startsWith('/_app') || event.url.pathname.includes('.')) {
+		return await resolve(event);
+	}
 
-    // 1. Silent Refresh Logic
-    // If the access token is missing or expired, but we have a refresh token
-    if (!accessToken && refreshToken) {
-        try {
-            // Ask the Go API for a new token pair
-            const response = await fetch('http://127.0.0.1:8080/api/v1/auth/refresh', {
-                method: 'POST',
-                headers: { 'Cookie': `kari_refresh_token=${refreshToken}` }
-            });
+	let accessToken = event.cookies.get('kari_access_token');
+	const refreshToken = event.cookies.get('kari_refresh_token');
 
-            if (response.ok) {
-                // The Go API sets the new HttpOnly cookies in the Set-Cookie header.
-                // We must proxy these new cookies to the user's browser.
-                const setCookieHeaders = response.headers.getSetCookie();
-                for (const cookieStr of setCookieHeaders) {
-                    event.setHeaders({ 'Set-Cookie': cookieStr });
-                }
-                
-                // Extract the new access token to use for this current request
-                const cookieParts = setCookieHeaders.find(c => c.startsWith('kari_access_token='));
-                if (cookieParts) {
-                    accessToken = cookieParts.split(';')[0].split('=')[1];
-                }
-            } else {
-                // Refresh token is dead or revoked. Clear everything.
-                event.cookies.delete('kari_refresh_token', { path: '/' });
-            }
-        } catch (err) {
-            console.error("Failed to refresh token:", err);
-        }
-    }
+	// 1. Silent Refresh Logic
+	if (!accessToken && refreshToken) {
+		try {
+			// Ask the Go API for a new token pair
+			const response = await event.fetch(`${env.INTERNAL_API_URL}/api/v1/auth/refresh`, {
+				method: 'POST',
+				// Forwarding the refresh cookie
+				headers: { 'Cookie': `kari_refresh_token=${refreshToken}` }
+			});
 
-    // 2. Decode the Token and Populate Locals
-    if (accessToken) {
-        try {
-            const decoded = jwtDecode<KariJwtPayload>(accessToken);
-            // Check if token is actually expired (fallback in case it wasn't caught above)
-            if (decoded.exp * 1000 > Date.now()) {
-                // Inject the user object into SvelteKit's event context
-                event.locals.user = {
-                    id: decoded.sub,
-                    role: decoded.role
-                };
-            }
-        } catch (error) {
-            // Malformed token, ignore it
-            event.locals.user = null;
-        }
-    } else {
-        event.locals.user = null;
-    }
+			if (response.ok) {
+				// 🛡️ SvelteKit's fetch automatically handles 'Set-Cookie' 
+				// if configured, but manual proxying is safer for cross-domain.
+				accessToken = event.cookies.get('kari_access_token');
+			} else {
+				event.cookies.delete('kari_refresh_token', { path: '/' });
+				event.cookies.delete('kari_access_token', { path: '/' });
+			}
+		} catch (err) {
+			console.error("Brain Connectivity Error:", err);
+		}
+	}
 
-    // 3. Resolve the request (Proceeds to load functions and routing)
-    return await resolve(event);
+	// 2. 🛡️ Secure Verification
+	if (accessToken) {
+		try {
+			const secret = new TextEncoder().encode(env.JWT_SECRET);
+			const { payload } = await jose.jwtVerify(accessToken, secret);
+
+			// Inject verified data into locals
+			event.locals.user = {
+				id: payload.sub as string,
+				role: payload.role as 'admin' | 'tenant'
+			};
+		} catch (error) {
+			// Token invalid, expired, or tampered with
+			event.locals.user = null;
+		}
+	} else {
+		event.locals.user = null;
+	}
+
+	return await resolve(event);
 };
