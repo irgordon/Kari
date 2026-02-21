@@ -2,41 +2,48 @@
 # ==============================================================================
 # 🛡️ Kari Hardened Idempotent Installer
 # ==============================================================================
-set -euo pipefail # 🛡️ SLA: Exit on error, unset variables, or pipe failure
+set -euo pipefail
 
-# ... [Brand Colors & ASCII Art] ...
+# --- Color formatting ---
+TEAL='\033[0;36m'
+GRAY='\033[1;30m'
+GREEN='\033[0;32m'
+NC='\033[0m'
 
 # 1. 🛡️ Identity & Directory Provisioning
 echo -e "${GRAY}[1/5] Provisioning secure users and paths...${NC}"
 
-# Create the Brain's identity
+# Create the Brain's restricted identity
 if ! id "kari-api" &>/dev/null; then
     useradd -r -s /bin/false kari-api
 fi
 
-# Ensure 027 umask so new files are never world-readable by default
+# Ensure new files are never world-readable
 umask 027
 
-# Setup secure directories with strict ownership
+# Setup secure directories
 mkdir -p /etc/kari/ssl
 mkdir -p /var/run/kari
-mkdir -p /var/www/kari # 🛡️ SLA: Consistent with our config.rs refactor
+mkdir -p /var/www/kari
 mkdir -p /opt/kari/bin
 
 # 2. 🛡️ Permission Hardening
-# Muscle (Rust) owns the SSL storage
+echo -e "${GRAY}[2/5] Enforcing Zero-Trust SLA boundaries...${NC}"
+
+# Muscle (Rust) strictly owns the SSL storage. Go Brain cannot read this.
 chown root:root /etc/kari/ssl
 chmod 700 /etc/kari/ssl
 
-# Brain (Go) must own its runtime socket dir to manage the .sock lifecycle
-# We give the group to kari-api so it can create/delete the socket file
-chown kari-api:root /var/run/kari
+# 🛡️ SLA Fix: The Socket Directory
+# Root (Muscle) owns the directory to create the socket.
+# The kari-api group (Brain) is granted read/write access to communicate.
+chown root:kari-api /var/run/kari
 chmod 750 /var/run/kari
 
 # 3. 🛡️ Hardened Systemd Units
-echo -e "${GRAY}[2/5] Deploying hardened service units...${NC}"
+echo -e "${GRAY}[3/5] Deploying hardened service units...${NC}"
 
-# Brain (Go API) Service - Hardened to minimize API exploit surface
+# Brain (Go API) Service - Maximum Restriction
 cat <<EOF > /etc/systemd/system/kari-api.service
 [Unit]
 Description=Kari Go API Orchestrator
@@ -47,20 +54,27 @@ ExecStart=/opt/kari/bin/kari-api
 Restart=always
 User=kari-api
 Group=kari-api
-EnvironmentFile=/etc/kari/api.env
+EnvironmentFile=-/etc/kari/api.env
 
-# 🛡️ Kari Security Sandbox
-ProtectSystem=full
+# 🛡️ Kari Zero-Trust Sandbox
+# Make the entire OS read-only except the socket directory
+ProtectSystem=strict
+ReadWritePaths=/var/run/kari
 ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
 NoNewPrivileges=true
-CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_NET_ADMIN
+# Drop ALL capabilities, the Brain needs none to route HTTP/gRPC
+CapabilityBoundingSet=
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Muscle (Rust Agent) Service
+# Muscle (Rust Agent) Service - Elevated but Scoped
 cat <<EOF > /etc/systemd/system/kari-agent.service
 [Unit]
 Description=Kari Rust System Agent
@@ -71,24 +85,31 @@ ExecStart=/opt/kari/bin/kari-agent
 Restart=always
 User=root
 Group=root
+EnvironmentFile=-/etc/kari/agent.env
 
-# 🛡️ CAP_CHOWN and CAP_DAC_OVERRIDE are all the Muscle needs
-# We restrict it from unnecessary kernel modules
+# 🛡️ Muscle Sandbox
+# Needs root, but does not need to mess with kernel modules or hostnames
 ProtectKernelModules=true
+ProtectHostname=true
+RestrictRealtime=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 # 4. 🛡️ Binary Integrity
-# Ensure binaries are immutable by anyone except root
+echo -e "${GRAY}[4/5] Securing executables...${NC}"
 chown -R root:root /opt/kari/bin
 chmod 755 /opt/kari/bin
-chmod 700 /opt/kari/bin/kari-agent # Only root should execute the Muscle
-chmod 755 /opt/kari/bin/kari-api   # Go Brain needs to be executable
+chmod 700 /opt/kari/bin/kari-agent # Only root can execute
+chmod 755 /opt/kari/bin/kari-api   # Brain needs rx
 
-# ... [Daemon Reload & Start] ...
+# 5. 🛡️ Daemon Reload & Enable
+echo -e "${GRAY}[5/5] Reloading systemd daemon...${NC}"
+systemctl daemon-reload
+# systemctl enable kari-agent kari-api # Uncomment to enable on boot
+# systemctl restart kari-agent kari-api # Uncomment to start immediately
 
-echo -e "${TEAL}------------------------------------------------"
-echo "✅ Kari Hardened Installation Complete!"
-echo -e "------------------------------------------------${NC}"
+echo -e "${TEAL}------------------------------------------------${NC}"
+echo -e "${GREEN}✅ Kari Hardened Installation Complete!${NC}"
+echo -e "${TEAL}------------------------------------------------${NC}"
