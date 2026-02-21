@@ -9,6 +9,8 @@ import (
 	"crypto/rand"
 	"fmt"
 	"log/slog"
+	"strings"
+	"time"
 
 	"github.com/go-acme/lego/v4/certificate"
 	"github.com/go-acme/lego/v4/challenge/http01"
@@ -16,7 +18,8 @@ import (
 	"github.com/go-acme/lego/v4/registration"
 
 	"kari/api/internal/config"
-	"kari/api/internal/grpc/rustagent"
+	// Assuming the generated protobuf package is aliased as pb
+	pb "kari/api/proto/kari/agent/v1" 
 )
 
 // ==============================================================================
@@ -31,41 +34,55 @@ type KariUser struct {
 
 func (u *KariUser) GetEmail() string                        { return u.Email }
 func (u *KariUser) GetRegistration() *registration.Resource { return u.Registration }
-func (u *KariUser) GetPrivateKey() crypto.PrivateKey       { return u.key }
+func (u *KariUser) GetPrivateKey() crypto.PrivateKey        { return u.key }
 
 // ==============================================================================
 // 2. Custom gRPC Challenge Provider
 // ==============================================================================
 
-/**
- * KariChallengeProvider implements the lego.Provider interface.
- * Instead of writing to a local disk, it asks the Rust Agent to write the 
- * challenge token to the web root via gRPC.
- */
 type KariChallengeProvider struct {
-	AgentClient rustagent.SystemAgentClient
-	WebRoot     string // e.g., "/var/www/html"
+	ctx         context.Context // Preserves cancellation SLA
+	AgentClient pb.SystemAgentClient
+	WebRoot     string
+	WebUser     string // Injected dynamically
+	WebGroup    string // Injected dynamically
 }
 
 func (p *KariChallengeProvider) Present(domain, token, keyAuth string) error {
+	// 🛡️ Zero-Trust Input Validation
+	if strings.Contains(token, "..") || strings.Contains(token, "/") {
+		return fmt.Errorf("SECURITY VIOLATION: Invalid ACME token format")
+	}
+
 	path := http01.ChallengePath(token)
 	fullPath := fmt.Sprintf("%s/%s", p.WebRoot, path)
 
-	_, err := p.AgentClient.WriteSystemFile(context.Background(), &rustagent.FileWriteRequest{
+	// Pass the parent context with a hard timeout to prevent hanging the Muscle
+	ctx, cancel := context.WithTimeout(p.ctx, 10*time.Second)
+	defer cancel()
+
+	_, err := p.AgentClient.WriteSystemFile(ctx, &pb.FileWriteRequest{
 		AbsolutePath: fullPath,
 		Content:      []byte(keyAuth),
-		Owner:        "www-data",
-		Group:        "www-data",
+		Owner:        p.WebUser,
+		Group:        p.WebGroup,
 		FileMode:     "0644",
 	})
 	return err
 }
 
 func (p *KariChallengeProvider) CleanUp(domain, token, keyAuth string) error {
+	if strings.Contains(token, "..") || strings.Contains(token, "/") {
+		return fmt.Errorf("SECURITY VIOLATION: Invalid ACME token format")
+	}
+
 	path := http01.ChallengePath(token)
 	fullPath := fmt.Sprintf("%s/%s", p.WebRoot, path)
 
-	_, err := p.AgentClient.ExecutePackageCommand(context.Background(), &rustagent.PackageRequest{
+	ctx, cancel := context.WithTimeout(p.ctx, 10*time.Second)
+	defer cancel()
+
+	_, err := p.AgentClient.ExecutePackageCommand(ctx, &pb.PackageRequest{
 		Command: "rm",
 		Args:    []string{"-f", fullPath},
 	})
@@ -78,11 +95,11 @@ func (p *KariChallengeProvider) CleanUp(domain, token, keyAuth string) error {
 
 type AcmeProvider struct {
 	Config      *config.Config
-	AgentClient rustagent.SystemAgentClient
+	AgentClient pb.SystemAgentClient
 	Logger      *slog.Logger
 }
 
-func NewAcmeProvider(cfg *config.Config, agent rustagent.SystemAgentClient, logger *slog.Logger) *AcmeProvider {
+func NewAcmeProvider(cfg *config.Config, agent pb.SystemAgentClient, logger *slog.Logger) *AcmeProvider {
 	return &AcmeProvider{
 		Config:      cfg,
 		AgentClient: agent,
@@ -93,7 +110,6 @@ func NewAcmeProvider(cfg *config.Config, agent rustagent.SystemAgentClient, logg
 func (p *AcmeProvider) ProvisionCertificate(ctx context.Context, email, domainName string) (*certificate.Resource, error) {
 	p.Logger.Info("Starting ACME certificate provision", slog.String("domain", domainName))
 
-	// 1. Setup private key for the ACME Account
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate account key: %w", err)
@@ -104,34 +120,38 @@ func (p *AcmeProvider) ProvisionCertificate(ctx context.Context, email, domainNa
 		key:   privateKey,
 	}
 
-	// 2. Initialize Lego Client
-	config := lego.NewConfig(&user)
-	// Platform Agnostic: Use production or staging based on environment config
-	config.CADirURL = "https://acme-v02.api.letsencrypt.org/directory"
+	legoCfg := lego.NewConfig(&user)
 	
-	client, err := lego.NewClient(config)
+	// 🛡️ Environment Agnostic: URL injected via configuration
+	if p.Config.AcmeDirectoryUrl != "" {
+		legoCfg.CADirURL = p.Config.AcmeDirectoryUrl
+	}
+	
+	client, err := lego.NewClient(legoCfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create lego client: %w", err)
 	}
 
-	// 3. Configure HTTP-01 Challenge via our gRPC Proxy
+	// 🛡️ Platform Agnostic: Injected User/Group and WebRoot
 	provider := &KariChallengeProvider{
+		ctx:         ctx,
 		AgentClient: p.AgentClient,
-		WebRoot:     "/var/www/html", // Standard global webroot for challenges
+		WebRoot:     p.Config.WebRoot,
+		WebUser:     p.Config.WebUser,
+		WebGroup:    p.Config.WebGroup,
 	}
+	
 	err = client.Challenge.SetHTTP01Provider(provider)
 	if err != nil {
 		return nil, fmt.Errorf("failed to set http01 provider: %w", err)
 	}
 
-	// 4. Register Account & Agree to Terms
 	reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
 	if err != nil {
 		return nil, fmt.Errorf("failed to register ACME account: %w", err)
 	}
 	user.Registration = reg
 
-	// 5. Request Certificate
 	request := certificate.ObtainRequest{
 		Domains: []string{domainName},
 		Bundle:  true,
@@ -142,14 +162,19 @@ func (p *AcmeProvider) ProvisionCertificate(ctx context.Context, email, domainNa
 		return nil, fmt.Errorf("failed to obtain certificate for %s: %w", domainName, err)
 	}
 
-	// 6. Securely Install via Rust Agent (The final memory-safe write)
-	// We pass the bytes to our InstallCertificate gRPC call, which utilizes 
-	// the zero-copy/secrecy logic in Rust.
-	_, err = p.AgentClient.InstallCertificate(ctx, &rustagent.SslPayload{
+	_, err = p.AgentClient.InstallCertificate(ctx, &pb.SslPayload{
 		DomainName:   domainName,
 		FullchainPem: certificates.Certificate,
 		PrivkeyPem:   certificates.PrivateKey,
 	})
+
+	// 🛡️ Memory Safety: Best-Effort Plaintext Zeroing in Go
+	// We physically overwrite the byte array with zeros so it is destroyed 
+	// before the Garbage Collector even runs.
+	for i := range certificates.PrivateKey {
+		certificates.PrivateKey[i] = 0
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("agent failed to install certificate: %w", err)
 	}
