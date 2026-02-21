@@ -1,6 +1,5 @@
 <div align="center">
   
-  
   <h1>Karı — Made Simple. Designed Secure. </h1>
   <p>A fast, friendly control panel that installs in minutes and makes server management effortless, safe, and actually enjoyable. Get powerful tools, a clean interface, and complete control without the clutter.</p>
 
@@ -21,116 +20,107 @@
 
 Karı is a next-generation server control panel built for the workflows of 2026 and beyond. Designed to replace legacy monolithic panels, Karı brings the seamless, GitOps-driven developer experience of platforms like Vercel or Railway directly to your own infrastructure. 
 
-Built with an unprivileged **Go** REST API and a memory-safe, root-level **Rust** system agent, Karı offers blisteringly fast performance and an impenetrable security boundary.
+Built with an unprivileged **Go** REST API and a memory-safe, root-level **Rust** system agent, Karı acts as a **Platform-Agnostic Orchestration Engine**, offering blisteringly fast performance and an impenetrable security boundary.
 
 ## ✨ Core Features
 
-* **GitOps by Default:** Native webhooks for GitHub/GitLab. Push to `main`, and Karı automatically clones, builds, and swaps your app with zero-downtime symlinks.
-* **Systemd User Jails:** First-class support for Node.js, Python, and Ruby. Apps run isolated under unprivileged system users with `ProtectSystem=full` and `PrivateTmp=true`, ensuring zero cross-tenant contamination.
-* **Automated Auto-Renewing SSL:** Native Let's Encrypt integration. Certificates are provisioned securely in memory, written directly to root-owned files via Rust, and auto-renewed by a background Go worker 30 days before expiration.
-* **Dynamic RBAC:** Shift beyond static roles. Create custom permission sets (e.g., "Junior Dev", "Auditor") with mathematical safeguards to prevent Super Admin lockouts.
-* **Privacy-First Audit Logs:** Centralized PostgreSQL logging separates tenant activity from global server alerts, surfaced via a proactive UI Action Center.
+* **Platform-Agnostic Orchestration:** The Go API dictates *intent* (Policies), while the Rust Agent handles OS-specific *execution* (Rules). Easily portable across Ubuntu, Debian, AlmaLinux, and Fedora.
+* **GitOps by Default:** Native webhooks for GitHub/GitLab validated via constant-time HMAC SHA-256. Push to `main`, and Karı clones, builds, and swaps your app with zero-downtime atomic symlinks.
+* **Systemd User Jails:** First-class support for Node.js, Python, PHP, and Ruby. Apps run isolated under unprivileged system users with strict cgroup quotas, `ProtectSystem=full`, and `PrivateTmp=true`.
+* **Zero-Copy Secrets:** Provider tokens and TLS private keys are wrapped in Rust `secrecy` and `zeroize` memory guards. Keys are physically overwritten in RAM the millisecond they are no longer needed.
+* **Automated Auto-Renewing SSL:** Native Let's Encrypt integration. Certificates are provisioned securely in memory, written directly to root-owned files, and auto-renewed by a background Go worker.
+* **Dynamic RBAC:** Shift beyond static roles. Create custom permission sets with mathematical safeguards to prevent Super Admin lockouts.
 * **Real-Time Observability:** End-to-end WebSockets stream deployment build logs directly to an XSS-proof `xterm.js` terminal UI in real-time.
-* **Secure by Design:** Strict privilege separation. The API runs unprivileged; the Rust agent runs as root, bypassing shell execution entirely (no `bash` injection) and communicating exclusively via gRPC over a locked-down Unix Domain Socket.
 
 ---
+
+
 
 ## 🏗️ Architecture
 
+Karı uses a strict privilege-separation model, splitting operations across three distinct boundaries to ensure absolute security and high performance. Data dictates behavior; there are zero hardcoded system paths or business defaults.
 
+```mermaid
+graph TD
+    %% Styling
+    classDef frontend fill:#ff3e00,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef backend fill:#00add8,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef agent fill:#000000,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef database fill:#336791,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef os fill:#444444,stroke:#fff,stroke-width:2px,color:#fff;
 
-Karı uses a Monorepo structure, split into three distinct boundaries:
+    %% Nodes
+    subgraph "The UI Layer"
+        UI["💻 Kari Web (SvelteKit SPA)<br/>Action Center, GitOps UI, RBAC Builder"]:::frontend
+    end
 
-1. **The UI (`/frontend`):** A decoupled, reactive Single Page Application built with SvelteKit.
-2. **The Brain (`/api`):** A Go-based REST API that manages state in PostgreSQL, handles RBAC authentication, and orchestrates workflows following strict SOLID principles.
-3. **The Muscle (`/agent`):** A Rust-based gRPC daemon running as root that executes highly validated system mutations (package management, systemd, file writes).
+    subgraph "The Brain (Unprivileged Orchestrator)"
+        API["🧠 Kari API (Go Daemon)<br/>RBAC, Let's Encrypt, Webhooks, Rate Limiting"]:::backend
+        DB[("🗄️ PostgreSQL<br/>Encrypted Secrets, Audit Logs, State")]:::database
+    end
+
+    subgraph "The Muscle (Root Executor)"
+        AGENT["⚙️ Kari Agent (Rust Daemon)<br/>Systemd Jails, Atomic Swaps, Zero-Copy Secrets"]:::agent
+    end
+
+    subgraph "The Host Environment"
+        OS["🐧 Linux OS<br/>Nginx, App Runtimes, CGroup Quotas"]:::os
+    end
+
+    %% Connections
+    UI <-->|HTTPS REST & WSS Streams| API
+    API <-->|SQL / JSONB| DB
+    API <-->|gRPC (Unix Socket 0o660)| AGENT
+    AGENT -->|Abstract Traits & Safe Exec| OS
+
+```
 
 ---
 
-```markdown
-# Karı Monorepo File Structure
+## 📂 Monorepo File Structure
 
+```markdown
 kari/
-├── .github/
-│   └── workflows/
-│       └── release.yml                 # CI/CD pipeline (Go build, Rust cross-compile, Svelte build)
-├── agent/                              # The Muscle (Rust gRPC Daemon)
-│   ├── build.rs                        
-│   ├── Cargo.toml                      
+├── .github/workflows/          # CI/CD pipelines (Go build, Rust cross-compile, Svelte build)
+├── agent/                      # The Muscle (Rust gRPC Daemon)
+│   ├── Cargo.toml              
 │   └── src/
-│       ├── main.rs                     # Entrypoint, secure Unix socket binding (0o660)
-│       ├── server.rs                   # gRPC SystemAgent implementation 
-│       └── sys/                        # System Integrations (SOLID SLAs)
-│           ├── jail.rs                 # Linux user creation and filesystem lockdown
-│           └── systemd.rs              # Generates secure systemd unit files (ProtectSystem=full)
-├── api/                                # The Brain (Go REST API)
-│   ├── cmd/
-│   │   └── kari-api/
-│   │       └── main.go                 # App entrypoint (wires dependencies, starts workers/router)
+│       ├── main.rs             # Entrypoint, secure Unix socket binding (0o660)
+│       ├── config.rs           # Environment-injected dynamic paths (No hardcoded paths)
+│       ├── server.rs           # gRPC SystemAgent implementation 
+│       └── sys/                # System Integrations (SOLID SLAs)
+│           ├── traits.rs       # Abstract interfaces (JobScheduler, FirewallManager, SslEngine)
+│           ├── secrets.rs      # Zeroize/Secrecy memory wrappers for credentials
+│           ├── scheduler.rs    # systemd timer concrete implementation
+│           ├── jail.rs         # Linux user creation and filesystem lockdown
+│           └── systemd.rs      # Generates secure systemd unit files (ProtectSystem=full)
+├── api/                        # The Brain (Go REST API)
+│   ├── cmd/kari-api/main.go    # App entrypoint (wires dependencies, starts workers/router)
 │   ├── internal/
-│   │   ├── adapters/                   # Concrete implementations (SLA)
-│   │   │   ├── nginx_manager.go        # text/template generation and Rust gRPC execution
-│   │   │   └── acme_provider.go        # Let's Encrypt / lego adapter for SSL
-│   │   ├── api/                        # HTTP Transport Layer
-│   │   │   ├── handlers/
-│   │   │   │   ├── application.go      
-│   │   │   │   ├── websocket.go        
-│   │   │   │   └── audit.go            # Privacy-first endpoints (tenant vs admin alerts)
-│   │   │   ├── middleware/
-│   │   │   │   └── auth.go             # JWT validation, Rate limiting, RequirePermission (RBAC)
-│   │   │   └── router/
-│   │   │       └── router.go           
-│   │   ├── core/                       # Business Logic (SOLID)
-│   │   │   ├── domain/                 # Structs & Repository Interfaces
-│   │   │   │   ├── application.go      
-│   │   │   │   ├── audit.go            
-│   │   │   │   ├── ssl.go              
-│   │   │   │   └── webserver.go        
-│   │   │   ├── services/               # Orchestrators
-│   │   │   │   ├── audit_service.go    # Enforces tenant data isolation
-│   │   │   │   ├── ssl_service.go      # Orchestrates Let's Encrypt & Rust file writes
-│   │   │   │   └── user_service.go     # RBAC logic (prevents Super Admin lockout)
-│   │   │   └── utils/
-│   │   │       └── cert_parser.go      # Reads PEM file expiration dates
-│   │   ├── db/                         # Database Layer
-│   │   │   ├── migrations/
-│   │   │   │   ├── 001_initial_schema.sql # Postgres tables (users, domains, apps)
-│   │   │   │   ├── 002_audit_logs.sql     # Centralized logging & system alerts
-│   │   │   │   └── 003_dynamic_rbac.sql   # Roles, Permissions, and Mapping tables
-│   │   │   └── postgres/
-│   │   │       ├── application_repo.go 
-│   │   │       └── audit_repo.go       # Dynamically built SQL queries for logs
-│   │   ├── workers/
-│   │   │   └── ssl_renewer.go          # Background cron job for automated certificate renewals
-│   │   └── grpc/                       # Generated Go gRPC client (from proto)
-├── frontend/                           # The UI (SvelteKit SPA)
+│   │   ├── config/config.go    # Centralized configuration (No hardcoded paths)
+│   │   ├── adapters/           # Concrete implementations (SLA)
+│   │   ├── api/                # HTTP Transport Layer (Middleware, Handlers, Router)
+│   │   ├── core/               # Business Logic (SOLID)
+│   │   │   ├── domain/         # Structs, Profile configs, & Repository Interfaces
+│   │   │   └── services/       # Orchestrators (Auth, App, SSL)
+│   │   ├── db/                 # PostgreSQL migrations and queries
+│   │   ├── workers/            # Background cron jobs (SSL Renewer)
+│   │   └── grpc/               # Generated Go gRPC client (from proto)
+├── frontend/                   # The UI (SvelteKit SPA)
 │   ├── package.json
+│   ├── tailwind.config.ts      # Brand palette and typography mapping
 │   └── src/
-│       ├── hooks.server.ts             # Server-side JWT gatekeeper, silent refresh logic
-│       ├── lib/                        # Shared UI utilities and components
-│       │   ├── api/                    # Frontend SLA Layer
-│       │   │   ├── domains.ts          
-│       │   │   └── terminalStream.ts   
-│       │   └── components/             # SRP UI Components
-│       │       ├── admin/
-│       │       │   └── ActionCenter.svelte # Displays unresolved critical system alerts
-│       │       ├── DeploymentTerminal.svelte 
-│       │       └── DomainList.svelte   
-│       └── routes/                     # Filesystem Routing
-│           ├── (app)/                  # Authenticated routes 
-│           │   ├── +layout.server.ts   
-│           │   ├── dashboard/          # Includes ActionCenter for Admins
-│           │   └── domains/            
-│           └── (auth)/                 
-│               └── login/              
-├── proto/                              # The Contract
-│   └── kari/agent/v1/agent.proto       
-├── scripts/                            # DevOps & DX
-│   ├── dev.sh                          
-│   └── install.sh                      # Idempotent installer with CDN failover
-├── docker-compose.yml                  
-├── README.md                           
-└── TECHNICAL_SPEC.md                   
+│       ├── hooks.server.ts     # Server-side JWT gatekeeper, silent refresh logic
+│       ├── lib/                # Shared UI utilities and components
+│       │   ├── api/            # Frontend SLA Layer (client.ts, terminalStream.ts)
+│       │   └── components/     # SRP UI Components (DeploymentTerminal, EnvironmentEditor)
+│       └── routes/             # Filesystem Routing
+│           ├── (app)/          # Authenticated routes & +layout.svelte shell
+│           └── (auth)/         # XSS-proof form actions
+├── proto/                      # The Contract
+│   └── kari/agent/v1/agent.proto # Abstract intent definitions (FirewallPolicy, JobIntent)
+├── scripts/                    # DevOps & DX
+└── docker-compose.yml          
 
 ```
 
@@ -162,39 +152,37 @@ curl -sSL [https://raw.githubusercontent.com/irgordon/kari/main/scripts/install.
 ### Getting Started
 
 1. **Clone the repository:**
+
 ```bash
 git clone [https://github.com/irgordon/kari.git](https://github.com/irgordon/kari.git)
 cd kari
 
 ```
 
-
 2. **Generate the gRPC Protobufs:**
 Ensure the contract between Go and Rust is up to date.
+
 ```bash
 make proto-gen
 
 ```
 
-
 3. **Start the development services:**
 You can run the full stack locally using our provided script:
+
 ```bash
 ./scripts/dev.sh
 
 ```
 
-
 * *Frontend:* `http://localhost:5173`
 * *Go API:* `http://localhost:8080`
-
-
 
 ---
 
 ## 🛡️ Security
 
-Security is the foundational principle of Karı. We utilize a strict two-token JWT architecture (HttpOnly cookies for the browser UI, and Personal Access Tokens for CLI usage).
+Security is the foundational principle of Karı. We utilize a strict two-token JWT architecture (HttpOnly cookies for the browser UI, and Personal Access Tokens for CLI usage), AES-256-GCM encryption for database secrets, and memory-safe Rust execution.
 
 If you discover a security vulnerability, please do **NOT** open a public issue. Email `security@kariapp.dev` directly.
 
@@ -205,7 +193,5 @@ If you discover a security vulnerability, please do **NOT** open a public issue.
 This project is licensed under the **[MIT License](https://mit-license.org/)**.
 
 © 2026 Karı Project - *Made Simple. Designed Secure.*
-
-```
 
 ```
