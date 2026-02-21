@@ -1,5 +1,63 @@
 <div align="center">
-  
+  <svg xmlns="http://www.w3.org/2000/svg" width="240" height="300" viewBox="0 0 240 300">
+  <defs>
+    <linearGradient id="kariGradient" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#389494"/>
+      <stop offset="50%" stop-color="#38946f"/>
+      <stop offset="100%" stop-color="#386f94"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Emblem group -->
+  <g transform="translate(60, 0)">
+    <!-- Shield -->
+    <path
+      d="M60 10
+         C40 10 25 18 25 18
+         V90
+         C25 118 40 140 60 158
+         C80 140 95 118 95 90
+         V18
+         C95 18 80 10 60 10
+         Z"
+      fill="url(#kariGradient)"
+    />
+
+    <!-- Bird head + neck -->
+    <path
+      d="M72 42
+         C68 38 63 37 58 38
+         C53 39 49.5 42 47.5 46
+         C50.5 45.3 53 45.6 55.4 46.7
+         C52.2 48.2 49.9 51.1 48.7 54.7
+         C51.4 53.6 53.9 53.5 56.3 54.1
+         C53.3 56.1 51.3 59.4 50.7 63.2
+         C54.1 61.6 57.3 61.1 60.3 61.5
+         C64.8 62 68.7 64 71.4 67.1
+         C71.9 64.1 71.8 61.2 71.2 58.3
+         C70.2 53 68.4 48.5 66 45
+         Z"
+      fill="#ffffff"
+      fill-opacity="0.9"
+    />
+
+    <!-- Eye -->
+    <circle cx="71" cy="42.5" r="2.5" fill="#ffffff"/>
+  </g>
+
+  <!-- Text -->
+  <text
+    x="120"
+    y="250"
+    font-family="SF Pro, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+    font-size="64"
+    font-weight="600"
+    fill="#1A1A1C"
+    text-anchor="middle">
+    Kari
+  </text>
+</svg>
+
   <h1>Karı — Made Simple. Designed Secure. </h1>
   <p>A fast, friendly control panel that installs in minutes and makes server management effortless, safe, and actually enjoyable. Get powerful tools, a clean interface, and complete control without the clutter.</p>
 
