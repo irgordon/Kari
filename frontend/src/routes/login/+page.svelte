@@ -3,14 +3,14 @@
     import { page } from '$app/stores';
     import type { ActionData } from './$types';
 
-    // Captures error messages returned by `fail()` in +page.server.ts
+    // Captures error messages and returned values (like email) from `fail()` in +page.server.ts
     export let form: ActionData;
 
     let isLoading = false;
     
     // 🛡️ State Persistence: Check if the user was kicked out
     // By storing this in a local variable initialized once, it survives form submissions
-    // even if the query parameter is stripped from the URL later.
+    // even if the query parameter is stripped from the URL later by SvelteKit routing.
     let sessionExpired = $page.url.searchParams.get('session') === 'expired';
 </script>
 
@@ -80,6 +80,41 @@
                     }
                 };
             }}>
+                
+                <div>
+                    <label for="email" class="block text-sm font-medium text-kari-text">
+                        Email address
+                    </label>
+                    <div class="mt-1">
+                        <input 
+                            id="email" 
+                            name="email" 
+                            type="email" 
+                            autocomplete="email" 
+                            required 
+                            value={form?.email ?? ''}
+                            class="appearance-none block w-full px-3 py-2 border border-kari-warm-gray/30 rounded-md shadow-sm placeholder-kari-warm-gray/70 focus:outline-none focus:ring-kari-teal focus:border-kari-teal sm:text-sm text-kari-text" 
+                            placeholder="admin@example.com"
+                        >
+                    </div>
+                </div>
+
+                <div>
+                    <label for="password" class="block text-sm font-medium text-kari-text">
+                        Password
+                    </label>
+                    <div class="mt-1">
+                        <input 
+                            id="password" 
+                            name="password" 
+                            type="password" 
+                            autocomplete="current-password" 
+                            required 
+                            class="appearance-none block w-full px-3 py-2 border border-kari-warm-gray/30 rounded-md shadow-sm placeholder-kari-warm-gray/70 focus:outline-none focus:ring-kari-teal focus:border-kari-teal sm:text-sm text-kari-text"
+                        >
+                    </div>
+                </div>
+
                 <div>
                     <button 
                         type="submit" 
