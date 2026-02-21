@@ -1,0 +1,110 @@
+// proto/kari/agent/v1/agent.proto
+syntax = "proto3";
+
+package kari.agent.v1;
+
+option go_package = "kari/api/internal/grpc/rustagent";
+
+// ==============================================================================
+// 1. The gRPC Service Definition
+// ==============================================================================
+
+service SystemAgent {
+  rpc ExecutePackageCommand(PackageRequest) returns (AgentResponse);
+  rpc WriteSystemFile(FileWriteRequest) returns (AgentResponse);
+  rpc ManageService(ServiceRequest) returns (AgentResponse);
+  rpc ProvisionAppJail(ProvisionJailRequest) returns (AgentResponse);
+  rpc DeployApplication(DeployRequest) returns (AgentResponse);
+
+  // --- NEW: Abstract Policy & Intent Endpoints ---
+  rpc ApplyFirewallPolicy(FirewallPolicy) returns (AgentResponse);
+  rpc ScheduleJob(JobIntent) returns (AgentResponse);
+  rpc InstallCertificate(SslPayload) returns (AgentResponse);
+}
+
+// ==============================================================================
+// 2. Standardized Response
+// ==============================================================================
+
+message AgentResponse {
+  bool success = 1;
+  int32 exit_code = 2;
+  string stdout = 3;
+  string stderr = 4;
+  string error_message = 5;
+}
+
+// ==============================================================================
+// 3. Abstract Intent Payloads (OS-Agnostic)
+// ==============================================================================
+
+message FirewallPolicy {
+  enum Action { ALLOW = 0; DENY = 1; REJECT = 2; }
+  enum Protocol { TCP = 0; UDP = 1; BOTH = 2; }
+  
+  Action action = 1;
+  uint32 port = 2;
+  Protocol protocol = 3;
+  string source_ip = 4; // e.g., "0.0.0.0/0" for global, or specific tenant IPs
+}
+
+message JobIntent {
+  string job_name = 1;             // e.g., "kari-backup-worker"
+  string command = 2;              // The binary/script to execute
+  string schedule_expression = 3;  // e.g., "@daily" or "0 4 * * *"
+  string run_as_user = 4;          // e.g., "kari-app-123"
+}
+
+message SslPayload {
+  string domain_name = 1;
+  bytes fullchain_pem = 2;
+  bytes privkey_pem = 3;           // Transmitted securely, wiped from RAM after disk write
+}
+
+// ==============================================================================
+// 4. Existing Operational Payloads
+// ==============================================================================
+
+message PackageRequest {
+  string command = 1;         
+  repeated string args = 2;   
+}
+
+message FileWriteRequest {
+  string trace_id = 1;        
+  string absolute_path = 2;   
+  bytes content = 3;          
+  string owner = 4;           
+  string group = 5;           
+  string file_mode = 6;       
+}
+
+message ServiceRequest {
+  string service_name = 1;    
+  ServiceAction action = 2;   
+}
+
+message ProvisionJailRequest {
+  string app_id = 1;          
+  string domain_name = 2;     
+  string start_command = 3;   
+  map<string, string> env_vars = 4; 
+}
+
+message DeployRequest {
+  string app_id = 1;
+  string domain_name = 2;
+  string repo_url = 3;        
+  string branch = 4;          
+  string build_command = 5;   
+  map<string, string> env_vars = 6; 
+}
+
+enum ServiceAction {
+  START = 0;
+  STOP = 1;
+  RESTART = 2;
+  RELOAD = 3;
+  ENABLE = 4;
+  DISABLE = 5;
+}
