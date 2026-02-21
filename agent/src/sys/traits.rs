@@ -1,78 +1,83 @@
-// agent/src/sys/traits.rs
-
 use async_trait::async_trait;
 use std::net::IpAddr;
+use std::collections::HashMap;
+use tokio::sync::mpsc;
+use tonic::Status;
+use crate::server::kari_agent::LogChunk;
 use crate::sys::secrets::ProviderCredential;
 
 // ==============================================================================
-// 1. Firewall Abstraction (Type-Safe & Zero-Trust)
+// 1. GitOps & Source Control (Transient Auth)
 // ==============================================================================
 
-/// 🛡️ SLA Enforcement: Mathematical bounds on allowed firewall actions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FirewallAction {
-    Allow,
-    Deny,
-    Reject,
+#[async_trait]
+pub trait GitManager: Send + Sync {
+    /// Clones a repository into a target directory.
+    /// 🛡️ ssh_key: An optional private key provided by the Go Brain. 
+    /// If Some, it must be used for this operation only and never persisted.
+    async fn clone_repo(
+        &self, 
+        repo_url: &str, 
+        branch: &str, 
+        target_dir: &str,
+        ssh_key: Option<&str> 
+    ) -> Result<(), String>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Protocol {
-    Tcp,
-    Udp,
-    Both,
+// ==============================================================================
+// 2. Build & Execution (Telemetry-Aware)
+// ==============================================================================
+
+#[async_trait]
+pub trait BuildManager: Send + Sync {
+    /// Executes a build command within an unprivileged jail.
+    /// 🛡️ log_tx: A streaming channel to pipe stdout/stderr back to the gRPC stream.
+    async fn execute_build(
+        &self,
+        build_command: &str,
+        working_dir: &str,
+        run_as_user: &str,
+        env_vars: &HashMap<String, String>,
+        log_tx: mpsc::Sender<Result<LogChunk, Status>>,
+        trace_id: String,
+    ) -> Result<(), String>;
 }
+
+// ==============================================================================
+// 3. Firewall Abstraction (Type-Safe & Zero-Trust)
+// ==============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirewallAction { Allow, Deny, Reject }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol { Tcp, Udp, Both }
 
 pub struct FirewallPolicy {
     pub action: FirewallAction,
-    pub port: u16,              // u16 is the mathematical bound for TCP/UDP ports (0-65535)
+    pub port: u16,
     pub protocol: Protocol,
-    pub source_ip: Option<IpAddr>, // Uses native Rust IP validation, None implies 'Any'
+    pub source_ip: Option<IpAddr>,
 }
 
 #[async_trait]
 pub trait FirewallManager: Send + Sync {
-    /// Applies a strict, type-safe policy. The underlying implementation decides if this
-    /// translates to `ufw allow ...` or `firewall-cmd --add-port=...`
     async fn apply_policy(&self, policy: &FirewallPolicy) -> Result<(), String>;
 }
 
 // ==============================================================================
-// 2. Job Scheduler Abstraction (Anti-Injection)
-// ==============================================================================
-
-pub struct JobIntent {
-    pub name: String,
-    // 🛡️ SLA Enforcement: We split the binary from the arguments to completely 
-    // neuter shell interpolation vulnerabilities in the underlying implementation.
-    pub binary: String,
-    pub args: Vec<String>,
-    pub schedule: String, // e.g., "0 4 * * *"
-    pub run_as_user: String,
-}
-
-#[async_trait]
-pub trait JobScheduler: Send + Sync {
-    /// Schedules a recurring job. The underlying implementation decides if this
-    /// translates to a `/etc/cron.d/` file or a `.timer` systemd unit.
-    async fn schedule_job(&self, intent: &JobIntent) -> Result<(), String>;
-}
-
-// ==============================================================================
-// 3. SSL Engine Abstraction (Memory Safe)
+// 4. SSL Engine Abstraction (Memory Safe)
 // ==============================================================================
 
 pub struct SslPayload {
     pub domain_name: String,
     pub fullchain_pem: Vec<u8>,
-    // 🛡️ Zero-Copy Secret. The memory will be physically zeroized the moment 
-    // the `install_certificate` function finishes execution.
+    /// 🛡️ Zero-Copy Secret. Handled by the ProviderCredential wrapper 
+    /// to ensure memory is zeroized after use.
     pub privkey_pem: ProviderCredential, 
 }
 
 #[async_trait]
 pub trait SslEngine: Send + Sync {
-    /// Installs the certificate to the correct distro-specific paths 
-    /// (e.g., /etc/ssl/certs vs /etc/pki/tls/certs)
     async fn install_certificate(&self, payload: SslPayload) -> Result<(), String>;
 }
