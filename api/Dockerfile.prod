@@ -1,0 +1,45 @@
+# ==============================================================================
+# STAGE 1: The Builder (Heavyweight)
+# ==============================================================================
+FROM golang:1.22-alpine AS builder
+
+# Install build dependencies for CGO (if needed) and git
+RUN apk add --no-cache git ca-certificates
+
+WORKDIR /app
+
+# 🛡️ SLA: Cache dependencies separately for faster build cycles
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# 🛡️ Build the main Brain (API)
+# -ldflags="-s -w" strips debug info to reduce binary size and hinder reverse engineering
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o kari-brain api/cmd/server/main.go
+
+# 🛡️ Build the Healthcheck prober
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o healthcheck api/cmd/healthcheck/main.go
+
+# ==============================================================================
+# STAGE 2: The Final Posture (Zero-Trust Distroless)
+# ==============================================================================
+# We use the static distroless image (nonroot version)
+FROM gcr.io/distroless/static-debian12:nonroot
+
+WORKDIR /app
+
+# Copy binaries from the builder
+COPY --from=builder /app/kari-brain .
+COPY --from=builder /app/healthcheck .
+
+# 🛡️ Security: Explicitly run as the nonroot user (UID 65532)
+# Ensure your Kari Agent is configured to expect this UID if using PeerCreds
+USER 65532:65532
+
+# Standard port for the Brain
+EXPOSE 8080
+
+# 🛡️ The Final Handshake
+ENTRYPOINT ["/app/kari-brain"]
