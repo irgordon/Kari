@@ -8,25 +8,32 @@ import (
 )
 
 func main() {
-	// 🛡️ Zero-Trust: Tight timeout to prevent hanging health checks
+	// 🛡️ Zero-Trust: Allow override but default to internal port
+	target := os.Getenv("HEALTHCHECK_TARGET")
+	if target == "" {
+		target = "http://localhost:8080/health"
+	}
+
+	// 🛡️ SLA: Tight timeout for orchestration responsiveness
 	client := http.Client{
 		Timeout: 2 * time.Second,
 	}
 
-	// Internal health endpoint on the Brain
-	resp, err := client.Get("http://localhost:8080/health")
+	start := time.Now()
+	resp, err := client.Get(target)
 	
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Healthcheck failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "❌ Kari Brain Unreachable: %v (Duration: %v)\n", err, time.Since(start))
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintf(os.Stderr, "Healthcheck failed: Received status %d\n", resp.StatusCode)
+		// This captures scenarios where the Brain is alive but the Muscle link is dead
+		fmt.Fprintf(os.Stderr, "⚠️ Kari Brain Paralyzed: Received HTTP %d (Duration: %v)\n", resp.StatusCode, time.Since(start))
 		os.Exit(1)
 	}
 
-	// System is Operational
+	// Success remains silent to keep Docker logs clean
 	os.Exit(0)
 }
