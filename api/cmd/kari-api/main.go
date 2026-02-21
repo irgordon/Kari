@@ -1,4 +1,3 @@
-// api/cmd/kari-api/main.go
 package main
 
 import (
@@ -21,8 +20,9 @@ import (
 	"kari/api/internal/config"
 	"kari/api/internal/core/services"
 	"kari/api/internal/db/postgres"
+	"kari/api/internal/infrastructure/crypto"
 	"kari/api/internal/workers"
-	"kari/api/internal/grpc/rustagent" // Generated from protobuf
+	"kari/api/internal/grpc/rustagent" 
 )
 
 func main() {
@@ -30,167 +30,149 @@ func main() {
 	// 1. Core Telemetry & Configuration
 	// ==============================================================================
 	
-	// Initialize structured JSON logging for secure, parseable audit trails
+	// Structured JSON logging is mandatory for 2026 production observability
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 	slog.SetDefault(logger)
 
-	logger.Info("🚀 Booting Karı API Orchestrator...")
+	logger.Info("🚀 Booting Karı API Orchestrator (The Brain)...")
 
-	// Load dynamic configuration (No hardcoded paths)
+	// Load environment-driven configuration
 	cfg := config.Load()
 
 	// ==============================================================================
-	// 2. Infrastructure Connections (The "Outbound" SLAs)
+	// 2. Outbound Infrastructure SLAs
 	// ==============================================================================
 
-	// Initialize PostgreSQL Connection Pool
+	// Initialize PostgreSQL (The State Layer)
 	dbPool, err := postgres.NewPool(context.Background(), cfg.DatabaseURL)
 	if err != nil {
-		logger.Error("Failed to connect to PostgreSQL", slog.String("error", err.Error()))
+		logger.Error("FATAL: Database connectivity failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 	defer dbPool.Close()
-	logger.Info("✅ Connected to PostgreSQL")
 
-	// Initialize gRPC connection to the root-level Rust Agent via Unix Domain Socket
-	// We use an insecure dialer here because Unix sockets are physically isolated to the host OS.
+	// Initialize gRPC link to the Rust Muscle over Unix Domain Socket
+	// UDS provides the lowest latency and highest security for on-host communication.
 	grpcDialer := func(ctx context.Context, addr string) (net.Conn, error) {
-		var d net.Dialer
-		return d.DialContext(ctx, "unix", addr)
+		return (&net.Dialer{}).DialContext(ctx, "unix", addr)
 	}
 	
 	grpcConn, err := grpc.Dial(
-		"/var/run/kari/agent.sock", 
+		cfg.AgentSocketPath, // e.g., "/var/run/kari/agent.sock"
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(grpcDialer),
 	)
 	if err != nil {
-		logger.Error("Failed to connect to Rust Agent", slog.String("error", err.Error()))
+		logger.Error("FATAL: gRPC link to Rust Agent failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 	defer grpcConn.Close()
 	
-	// Instantiate the Protobuf client
 	agentClient := rustagent.NewSystemAgentClient(grpcConn)
-	logger.Info("✅ Connected to Rust System Agent")
 
 	// ==============================================================================
-	// 3. Dependency Injection (Wiring the Layers)
+	// 3. Hardened Dependency Injection
 	// ==============================================================================
 
-	// -- Repositories (Data Access) --
-	appRepo := postgres.NewApplicationRepository(dbPool)
-	domainRepo := postgres.NewDomainRepository(dbPool)
-	auditRepo := postgres.NewAuditRepository(dbPool)
-	userRepo := postgres.NewUserRepository(dbPool)
-	roleRepo := postgres.NewRoleRepository(dbPool)
+	// -- 🛡️ Security Engine --
+	// Instantiate AEAD Crypto Service for context-bound secret management
+	cryptoService, err := crypto.NewAESCryptoService(cfg.MasterKeyHex)
+	if err != nil {
+		logger.Error("FATAL: Cryptographic engine initialization failed", slog.Any("error", err))
+		os.Exit(1)
+	}
 
-	// -- Core Services (Business Logic) --
-	auditService := services.NewAuditService(auditRepo, logger)
-	roleService := services.NewRoleService(roleRepo, logger)
-	authService := services.NewAuthService(userRepo, logger, cfg.JWTSecret)
+	// -- Repositories --
+	appRepo    := postgres.NewApplicationRepository(dbPool)
+	auditRepo  := postgres.NewAuditRepository(dbPool)
+	userRepo   := postgres.NewUserRepository(dbPool)
+
+	// -- Core Services --
+	// Auth handles hashing and JWT signing via the configured secret
+	authService := services.NewAuthService(userRepo, logger, cfg)
 	
-	sslService := services.NewSSLService(
-		cfg, 
-		domainRepo, 
-		agentClient, 
-		auditService, 
-		logger,
-	)
+	// EnvVarService uses the cryptoService to wrap/unwrap app secrets
+	envVarService := services.NewEnvVarService(appRepo, cryptoService, logger)
 	
-	appService := services.NewAppService(
-		cfg,
+	// AppService orchestrates the high-level GitOps/Deployment lifecycle
+	appService := services.NewApplicationService(
 		appRepo,
-		domainRepo,
+		auditRepo,
 		agentClient,
-		auditService,
 		logger,
+		envVarService,
 	)
 
-	// -- HTTP Handlers (Transport Layer) --
-	authHandler := handlers.NewAuthHandler(authService)
-	appHandler := handlers.NewAppHandler(appService)
-	domainHandler := handlers.NewDomainHandler(sslService, domainRepo)
-	auditHandler := handlers.NewAuditHandler(auditService)
-	wsHandler := handlers.NewWebSocketHandler(logger)
-
+	// -- HTTP Transport Handlers --
+	authHandler   := handlers.NewAuthHandler(authService)
+	appHandler    := handlers.NewAppHandler(appService, envVarService)
+	auditHandler  := handlers.NewAuditHandler(auditRepo)
+	
 	// -- Middleware --
-	authMiddleware := middleware.NewAuthMiddleware(authService, roleService, logger)
+	// AuthMiddleware protects routes based on the JWT state and User Rank
+	authMiddleware := middleware.NewAuthMiddleware(authService, logger)
 
 	// ==============================================================================
-	// 4. Background Workers (Automated System Maintenance)
+	// 4. Background Workers (Proactive Feedback Loop)
 	// ==============================================================================
 
-	// Create a root context for background workers that we can cancel on shutdown
 	workerCtx, cancelWorkers := context.WithCancel(context.Background())
 	defer cancelWorkers()
 
-	sslRenewer := workers.NewSSLRenewer(cfg, domainRepo, sslService, auditService, logger)
-	
-	// Start the cron worker in an isolated Goroutine
-	go sslRenewer.Start(workerCtx)
+	// Proactive Health Monitor: Checks app availability every 60s with 10-worker concurrency
+	appMonitor := workers.NewAppMonitor(appRepo, auditRepo, logger, 1*time.Minute)
+	go appMonitor.Start(workerCtx)
 
 	// ==============================================================================
-	// 5. HTTP Server Initialization
+	// 5. HTTP Gateway Lifecycle
 	// ==============================================================================
 
-	// Construct the chi router with our deeply-layered security middleware
-	routerConfig := router.RouterConfig{
+	mux := router.NewRouter(router.RouterConfig{
 		AuthHandler:    authHandler,
 		AppHandler:     appHandler,
-		DomainHandler:  domainHandler,
 		AuditHandler:   auditHandler,
-		WSHandler:      wsHandler,
 		AuthMiddleware: authMiddleware,
 		Logger:         logger,
-	}
-	
-	mux := router.NewRouter(routerConfig)
+	})
 
 	server := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      mux,
-		ReadTimeout:  15 * time.Second,  // Mitigate Slowloris attacks
-		WriteTimeout: 15 * time.Second,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
 	// ==============================================================================
-	// 6. Graceful Shutdown & Signal Handling
+	// 6. Signal Handling & Graceful Exit
 	// ==============================================================================
 
-	// Listen for OS interrupt signals (e.g., Ctrl+C, systemctl stop kari-api)
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
-	// Run the server in a goroutine so it doesn't block the signal listener
 	go func() {
-		logger.Info("🌐 HTTP Gateway listening", slog.String("port", cfg.Port))
+		logger.Info("🌐 HTTP Gateway active", slog.String("port", cfg.Port))
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("HTTP Server crashed", slog.String("error", err.Error()))
+			logger.Error("CRITICAL: Server crashed", slog.Any("error", err))
 			os.Exit(1)
 		}
 	}()
 
-	// Block main thread until a termination signal is received
 	<-stop
-	logger.Info("🛑 Termination signal received. Initiating graceful shutdown...")
+	logger.Info("🛑 Termination signal received. Flushing buffers...")
 
-	// 1. Cancel background workers (stops SSL renewal loops mid-sleep)
+	// 1. Terminate background processes (Stop monitoring/cron tasks)
 	cancelWorkers()
 
-	// 2. Shut down the HTTP server (gives active requests 10 seconds to finish)
+	// 2. Drain active HTTP connections (10-second window)
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelShutdown()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		logger.Error("HTTP Server forced to shutdown", slog.String("error", err.Error()))
-	} else {
-		logger.Info("✅ HTTP Server stopped cleanly")
+		logger.Error("ERROR: Forced shutdown occurred", slog.Any("error", err))
 	}
 
-	// dbPool and grpcConn will be cleanly closed by their defers at the end of main()
-	logger.Info("👋 Karı Orchestrator shutdown complete.")
+	logger.Info("✅ Karı Orchestrator shutdown complete. Stay efficient.")
 }
