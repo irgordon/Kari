@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Karı - Local Development Bootstrapper
-# Usage: ./scripts/dev.sh
+# Refactored for Platform Agnosticism, SOLID, and SLA Compliance.
 
 set -euo pipefail
 
@@ -11,12 +11,26 @@ YELLOW='\033[0;33m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
+# -----------------------------------------------------------------------------
+# 1. Platform-Agnostic Setup
+# -----------------------------------------------------------------------------
+# Determine the absolute path of the project root regardless of OS
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+DEV_DIR="$ROOT_DIR/.local-dev"
+
+# Detect Docker Compose command (support newer 'docker compose' and older v1)
+DOCKER_COMPOSE_CMD="docker compose"
+if ! docker compose version &>/dev/null; then
+    DOCKER_COMPOSE_CMD="docker-compose"
+fi
+
 echo -e "${CYAN}======================================================${NC}"
 echo -e "${CYAN}🚀 Starting Karı Local Development Environment...${NC}"
 echo -e "${CYAN}======================================================${NC}"
 
 # -----------------------------------------------------------------------------
-# 1. Pre-Flight Dependency Checks
+# 2. Pre-Flight Dependency Checks
 # -----------------------------------------------------------------------------
 check_cmd() {
     if ! command -v "$1" &> /dev/null; then
@@ -33,92 +47,105 @@ check_cmd "npm"
 echo -e "${GREEN}✅ All dependencies found.${NC}"
 
 # -----------------------------------------------------------------------------
-# 2. Local Environment Setup
+# 3. Local Environment Preparation
 # -----------------------------------------------------------------------------
-# We create a local-dev directory to hold our fake Unix sockets and logs 
-# so the Rust agent doesn't need root permissions to bind to /run/kari/
-DEV_DIR=".local-dev"
 mkdir -p "$DEV_DIR/tmp" "$DEV_DIR/logs"
 
 # Ensure frontend dependencies are installed
-if [ ! -d "frontend/node_modules" ]; then
+if [ ! -d "$ROOT_DIR/frontend/node_modules" ]; then
     echo -e "${YELLOW}📦 Installing SvelteKit dependencies...${NC}"
-    (cd frontend && npm install)
+    (cd "$ROOT_DIR/frontend" && npm install)
 fi
 
-# -----------------------------------------------------------------------------
-# 3. Database Bootstrapping (Docker Compose)
-# -----------------------------------------------------------------------------
-echo -e "${YELLOW}🗄️ Starting PostgreSQL via Docker...${NC}"
-# Assuming your docker-compose.yml has a service named 'postgres'
-docker compose up -d
+# Clean up stale socket file to prevent Rust Agent bind errors
+export KARI_SOCKET_PATH="$DEV_DIR/tmp/agent.sock"
+rm -f "$KARI_SOCKET_PATH"
 
-# Wait for Postgres to be ready
+# -----------------------------------------------------------------------------
+# 4. Database Bootstrapping (Docker Compose)
+# -----------------------------------------------------------------------------
+echo -e "${YELLOW}🗄️ Starting Infrastructure via $DOCKER_COMPOSE_CMD...${NC}"
+$DOCKER_COMPOSE_CMD up -d db # Targeted start of the 'db' service
+
+# Wait for Postgres using a more platform-agnostic check
 echo -e "${YELLOW}⏳ Waiting for database to accept connections...${NC}"
-sleep 3 # Give docker a moment to map ports
-until docker exec kari-postgres pg_isready -U kari_user &>/dev/null; do
+MAX_RETRIES=30
+COUNT=0
+until docker exec kari-db pg_isready -U kari_admin &>/dev/null || [ $COUNT -eq $MAX_RETRIES ]; do
     sleep 1
+    ((COUNT++))
 done
+
+if [ $COUNT -eq $MAX_RETRIES ]; then
+    echo -e "${RED}❌ Database failed to start in time.${NC}"
+    exit 1
+fi
 echo -e "${GREEN}✅ Database is ready.${NC}"
 
 # -----------------------------------------------------------------------------
-# 4. Process Management & Cleanup (The Trap)
+# 5. Process Management & Cleanup (The Trap)
 # -----------------------------------------------------------------------------
-# This array holds the Process IDs (PIDs) of our microservices
+# Use a more robust PID management system
 declare -a PIDS=()
 
 cleanup() {
     echo -e "\n${RED}🛑 Shutting down Karı Development Environment...${NC}"
     for pid in "${PIDS[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
-            kill "$pid"
+            # Send SIGTERM for graceful shutdown
+            kill "$pid" 2>/dev/null || true
         fi
     done
-    docker compose stop
+    $DOCKER_COMPOSE_CMD stop db
     echo -e "${GREEN}✅ All processes terminated gracefully. Goodbye!${NC}"
     exit 0
 }
 
-# Catch Ctrl+C (SIGINT) and system termination (SIGTERM)
-trap cleanup SIGINT SIGTERM
+trap cleanup SIGINT SIGTERM EXIT
 
 # -----------------------------------------------------------------------------
-# 5. Launch the Monorepo Services
+# 6. Launch the Monorepo Services
 # -----------------------------------------------------------------------------
-# We pass KARI_SOCKET_PATH as an environment variable override so Rust and Go
-# use our local ./tmp folder instead of the root-locked /run/kari directory.
-export KARI_SOCKET_PATH="$(pwd)/$DEV_DIR/tmp/agent.sock"
 
 # A. Start the Rust Agent (The Muscle)
 echo -e "${YELLOW}⚙️ Starting Rust Agent...${NC}"
-(cd agent && cargo run > "../$DEV_DIR/logs/agent.log" 2>&1) &
+(cd "$ROOT_DIR/agent" && cargo run > "$DEV_DIR/logs/agent.log" 2>&1) &
 PIDS+=($!)
 
 # B. Start the Go API (The Brain)
+# Using 'go run' directly for local dev to avoid path issues
 echo -e "${YELLOW}🧠 Starting Go API...${NC}"
-# Note: we pass a fake development JWT secret and DB URL via env vars
-(cd api && \
- DATABASE_URL="postgres://kari_user:kari_pass@localhost:5432/kari_db?sslmode=disable" \
- JWT_SECRET="dev_secret_key_12345" \
- go run ./cmd/kari-api/main.go > "../$DEV_DIR/logs/api.log" 2>&1) &
+(cd "$ROOT_DIR/api" && \
+ DATABASE_URL="postgres://kari_admin:dev_password_only@localhost:5432/kari?sslmode=disable" \
+ JWT_SECRET="dev_secret_for_testing_only" \
+ PORT="8080" \
+ go run ./cmd/kari-api/main.go > "$DEV_DIR/logs/api.log" 2>&1) &
 PIDS+=($!)
 
 # C. Start the SvelteKit Frontend (The UI)
 echo -e "${YELLOW}🎨 Starting SvelteKit UI...${NC}"
-(cd frontend && npm run dev > "../$DEV_DIR/logs/frontend.log" 2>&1) &
+(cd "$ROOT_DIR/frontend" && npm run dev > "$DEV_DIR/logs/frontend.log" 2>&1) &
 PIDS+=($!)
 
 # -----------------------------------------------------------------------------
-# 6. Stream Logs to the Developer
+# 7. Monitoring & Logging
 # -----------------------------------------------------------------------------
 echo -e "${GREEN}======================================================${NC}"
 echo -e "${GREEN}🎉 Karı is running locally!${NC}"
-echo -e "   🌐 UI:       ${CYAN}http://localhost:5173${NC}"
-echo -e "   🔌 API:      ${CYAN}http://localhost:8080${NC}"
-echo -e "   🛡️ Socket:   ${CYAN}$KARI_SOCKET_PATH${NC}"
+echo -e "    🌐 UI:       ${CYAN}http://localhost:5173${NC}"
+echo -e "    🔌 API:      ${CYAN}http://localhost:8080${NC}"
+echo -e "    🛡️ Socket:   ${CYAN}$KARI_SOCKET_PATH${NC}"
 echo -e "${GREEN}======================================================${NC}"
 echo -e "Streaming logs... (Press ${RED}Ctrl+C${NC} to stop all services)"
 echo ""
 
-# Use 'tail' to multiplex the logs from all three services into the current terminal
+# SLA: Check if processes actually stayed alive
+sleep 2
+for pid in "${PIDS[@]}"; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo -e "${RED}❌ One of the services failed to start. Check .local-dev/logs/${NC}"
+        cleanup
+    fi
+done
+
 tail -f "$DEV_DIR/logs/agent.log" "$DEV_DIR/logs/api.log" "$DEV_DIR/logs/frontend.log"
