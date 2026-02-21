@@ -46,7 +46,7 @@
         terminal.open(terminalElement);
         fitAddon.fit();
 
-        // Handle window resizing
+        // Handle window resizing without relying on global window events
         const resizeObserver = new ResizeObserver(() => {
             fitAddon.fit();
         });
@@ -94,7 +94,7 @@
     });
 </script>
 
-<div class="card flex flex-col h-[600px] w-full bg-white">
+<div class="card flex flex-col h-[600px] w-full bg-white shadow-sm border border-kari-warm-gray/20">
     <div class="h-12 border-b border-kari-warm-gray/20 flex items-center justify-between px-4 shrink-0 bg-gray-50/50">
         <div class="flex items-center gap-3">
             <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-kari-warm-gray" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -102,7 +102,8 @@
             </svg>
             <h3 class="font-sans font-semibold text-sm text-kari-text">Deployment Logs</h3>
             <span class="text-xs font-mono text-kari-warm-gray bg-kari-warm-gray/10 px-2 py-0.5 rounded">
-                {traceId.split('-')[0]} </span>
+                {traceId.split('-')[0]} 
+            </span>
         </div>
 
         <div class="flex items-center gap-2">
@@ -134,20 +135,8 @@
 </div>
 
 <style>
-    /* Optional overrides to make xterm's scrollbar match our brand.
-       Since the terminal background is dark, we use a subtle dark scrollbar. 
-    */
-    :global(.xterm-viewport::-webkit-scrollbar) {
-        width: 8px;
-    }
-    :global(.xterm-viewport::-webkit-scrollbar-track) {
-        background: #1A1A1C;
-    }
-    :global(.xterm-viewport::-webkit-scrollbar-thumb) {
-        background: #8E8F93; /* Warm Gray */
-        border-radius: 4px;
-    }
-    :global(.xterm-viewport::-webkit-scrollbar-thumb:hover) {
-        background: #1BA8A0; /* Primary Teal */
-    }
+    :global(.xterm-viewport::-webkit-scrollbar) { width: 8px; }
+    :global(.xterm-viewport::-webkit-scrollbar-track) { background: #1A1A1C; }
+    :global(.xterm-viewport::-webkit-scrollbar-thumb) { background: #8E8F93; border-radius: 4px; }
+    :global(.xterm-viewport::-webkit-scrollbar-thumb:hover) { background: #1BA8A0; }
 </style>
