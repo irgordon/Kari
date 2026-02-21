@@ -5,6 +5,32 @@ All notable changes to the Karı Orchestration Engine will be documented in this
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.3] - 2026-02-21
+
+### 🛡️ Security & Cryptography
+- **Memory Hygiene**: Implemented `ProviderCredential` using the `secrecy` crate. All sensitive tokens (SSH keys, SSL private keys) are now zeroized in RAM immediately after use, preventing memory-scraping attacks.
+- **Physical Disk Scrubbing**: Updated `GitManager` to physically overwrite temporary SSH key files with zeroes on the SSD before unlinking, preventing forensic recovery of transient credentials.
+- **Anti-Enumeration**: Hardened `AuthService` with dummy Bcrypt hashing to equalize response times, neutralizing timing attacks used for user discovery.
+- **AEAD Integrity**: Upgraded `AESCryptoService` to use AES-256-GCM with **Associated Data (AAD)**. This cryptographically binds encrypted secrets to specific AppIDs/UserIDs, preventing "Confused Deputy" data swapping.
+- **Credential Hashing**: Opaque refresh tokens are now stored as SHA-256 hashes in PostgreSQL; a database leak no longer results in session hijacking.
+
+### 🏗️ Muscle (Rust Agent) Improvements
+- **Polymorphic Proxying**: Consolidated `ProxyManager` to support both **Nginx** and **Apache** via a single trait. Added boot-time auto-discovery to detect the host's web server.
+- **Process Group Isolation**: Build commands now run in a dedicated Linux Process Group with `kill_on_drop(true)`. If a gRPC stream disconnects, the parent and all child processes (e.g., `npm install`) are terminated instantly.
+- **Race Condition (TOCTOU) Fixes**:
+    - `SslEngine` now uses `OpenOptionsExt` to set `0o600` permissions at the moment of file creation.
+    - `JailManager` and `CleanupManager` now use `fs::canonicalize` to resolve absolute physical paths, defeating relative symlink-based escape attempts.
+- **Argument Injection Defense**: Implemented a strict whitelist and metacharacter blacklist (`;|&`) for package management and build commands.
+
+### ⚙️ Brain (Go API) & Orchestration
+- **Optimistic Concurrency (OCC)**: Introduced version-based locking in the `SystemProfile` domain and PostgreSQL repository. Prevents "Lost Update" scenarios when multiple admins modify settings simultaneously.
+- **Kernel-Level Auth**: Reinforced `SO_PEERCRED` verification. The Agent now strictly validates the numeric UID of the Go API container, rejecting any cross-container communication not originating from the Brain.
+- **Strict Typing**: Refactored all internal boundaries to use `std::path::Path` instead of raw strings, pushing path sanitization to the outermost edge of the gRPC server.
+
+### 🚀 Infrastructure
+- **Zero-Trust Networking**: Refactored `docker-compose.yml` to use an internal `backplane` network with no internet access for the Database and Agent.
+- **Cryptographic Bootstrapping**: Added a secure bash generator (`gen-secrets.sh`) using `/dev/urandom` to produce high-entropy 256-bit encryption keys and JWT secrets.
+
 ## [v0.0.2] - 2026-02-21
 
 ### 🛡️ Security
