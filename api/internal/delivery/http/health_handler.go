@@ -2,8 +2,12 @@ package http
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"kari/api/proto/agent"
 )
 
@@ -16,22 +20,42 @@ func NewHealthHandler(client agent.SystemAgentClient) *HealthHandler {
 }
 
 func (h *HealthHandler) Check(w http.ResponseWriter, r *http.Request) {
-	// 🛡️ SLA: Use a tight timeout for health checks
+	// 🛡️ SLA: 2 seconds is the "Hard Boundary" for a reactive orchestration boot
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 
-	// Perform a low-impact gRPC call to verify the Muscle is awake
-	// We'll use a standard 'Ping' or equivalent no-op command
+	// 🛡️ Zero-Trust: Prevent upstream proxies from caching health status
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+
+	// 📡 Perform the "Heartbeat" probe to the Muscle
 	_, err := h.agentClient.GetSystemStatus(ctx, &agent.Empty{})
-	
+
 	if err != nil {
-		// 🚨 FAIL: The Brain is up, but the Muscle is paralyzed
+		st, ok := status.FromError(err)
+		
+		// 🚨 Forensic Analysis: Why did the link fail?
+		errorMessage := "unhealthy: gRPC link severed"
+		if ok {
+			switch st.Code() {
+			case codes.DeadlineExceeded:
+				errorMessage = "unhealthy: agent response timed out (high load)"
+			case codes.Unavailable:
+				errorMessage = "unhealthy: agent unreachable (socket missing or agent down)"
+			case codes.PermissionDenied:
+				errorMessage = "unhealthy: peer credential verification failed"
+			default:
+				errorMessage = fmt.Sprintf("unhealthy: agent error (%s)", st.Code())
+			}
+		}
+
 		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte("unhealthy: gRPC link to agent severed"))
+		fmt.Fprint(w, errorMessage)
 		return
 	}
 
-	// ✅ PASS: Full system integrity verified
+	// ✅ PASS: The Brain and Muscle are synchronized
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("healthy"))
+	fmt.Fprint(w, "healthy")
 }
