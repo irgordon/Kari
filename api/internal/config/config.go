@@ -1,32 +1,47 @@
-// api/internal/config/config.go
 package config
 
-import "os"
+import (
+	"log"
+	"os"
+)
 
-// Config holds all dynamic configuration, ensuring no hardcoded values exist in the business logic.
+// Config holds all dynamic configuration for the Brain.
+// 🛡️ SLA: It knows NOTHING about the host operating system's filesystem.
 type Config struct {
+	Environment string // "development" or "production"
 	DatabaseURL string
 	Port        string
 	
-	// Dynamic System Paths
-	WebRootPath   string // e.g., "/var/www"
-	NginxConfPath string // e.g., "/etc/nginx/sites-available"
-	SSLStorageDir string // e.g., "/etc/kari/ssl"
+	// 🛡️ Zero-Trust Identity
+	JWTSecret   string
+
+	// 🛡️ The Execution Boundary
+	AgentSocket string // e.g., "/var/run/kari/agent.sock"
 }
 
 // Load parses the environment and applies sensible default fallbacks.
 func Load() *Config {
+	env := getEnv("KARI_ENV", "production")
+	
+	// 1. 🛡️ Zero-Trust: Fail Fast on Missing Secrets
+	jwtSecret := getEnv("JWT_SECRET", "")
+	if jwtSecret == "" && env == "production" {
+		// Never boot securely without a cryptographic signing key
+		log.Fatal("🚨 [FATAL] JWT_SECRET environment variable is required in production.")
+	}
+
 	return &Config{
-		DatabaseURL:   getEnv("DATABASE_URL", "postgres://kari:kari@localhost:5432/kari?sslmode=disable"),
-		Port:          getEnv("PORT", "8080"),
+		Environment: env,
+		DatabaseURL: getEnv("DATABASE_URL", "postgres://kari_admin:dev_password@localhost:5432/kari?sslmode=disable"),
+		Port:        getEnv("PORT", "8080"),
+		JWTSecret:   jwtSecret,
 		
-		// System paths now driven entirely by data/environment
-		WebRootPath:   getEnv("KARI_WEB_ROOT", "/var/www"),
-		NginxConfPath: getEnv("KARI_NGINX_CONF", "/etc/nginx/sites-available"),
-		SSLStorageDir: getEnv("KARI_SSL_DIR", "/etc/kari/ssl"),
+		// 2. 🛡️ Network Agnosticism: The only way the Brain talks to the Muscle
+		AgentSocket: getEnv("AGENT_SOCKET", "/var/run/kari/agent.sock"),
 	}
 }
 
+// getEnv retrieves an environment variable or returns a fallback value.
 func getEnv(key, fallback string) string {
 	if value, exists := os.LookupEnv(key); exists {
 		return value
