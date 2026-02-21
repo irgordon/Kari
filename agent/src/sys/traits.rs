@@ -1,26 +1,29 @@
 use async_trait::async_trait;
 use std::net::IpAddr;
 use std::collections::HashMap;
+use std::path::Path;
 use tokio::sync::mpsc;
 use tonic::Status;
+
 use crate::server::kari_agent::LogChunk;
 use crate::sys::secrets::ProviderCredential;
 
 // ==============================================================================
-// 1. GitOps & Source Control (Transient Auth)
+// 1. GitOps & Source Control (Zero-Leak Auth)
 // ==============================================================================
 
 #[async_trait]
 pub trait GitManager: Send + Sync {
-    /// Clones a repository into a target directory.
-    /// 🛡️ ssh_key: An optional private key provided by the Go Brain. 
-    /// If Some, it must be used for this operation only and never persisted.
+    /// Clones a repository into a strictly typed target directory.
+    /// 🛡️ Zero-Trust: ssh_key MUST be passed inside the ProviderCredential wrapper.
+    /// By taking `Option<ProviderCredential>` by value, we transfer ownership to the 
+    /// implementation, ensuring it is proactively zeroized the moment the clone finishes.
     async fn clone_repo(
         &self, 
         repo_url: &str, 
         branch: &str, 
-        target_dir: &str,
-        ssh_key: Option<&str> 
+        target_dir: &Path, // 🛡️ SLA: Strict Type
+        ssh_key: Option<ProviderCredential> 
     ) -> Result<(), String>;
 }
 
@@ -35,7 +38,7 @@ pub trait BuildManager: Send + Sync {
     async fn execute_build(
         &self,
         build_command: &str,
-        working_dir: &str,
+        working_dir: &Path, // 🛡️ SLA: Strict Type
         run_as_user: &str,
         env_vars: &HashMap<String, String>,
         log_tx: mpsc::Sender<Result<LogChunk, Status>>,
@@ -71,9 +74,11 @@ pub trait FirewallManager: Send + Sync {
 
 pub struct SslPayload {
     pub domain_name: String,
-    pub fullchain_pem: Vec<u8>,
-    /// 🛡️ Zero-Copy Secret. Handled by the ProviderCredential wrapper 
-    /// to ensure memory is zeroized after use.
+    pub fullchain_pem: String, // PEMs are valid UTF-8, String is safer for validation than raw Vec<u8>
+    
+    /// 🛡️ Zero-Copy Secret. The SslEngine takes ownership of this struct,
+    /// writes the key to the protected `/etc/kari/ssl` directory, and immediately
+    /// calls `.destroy()` on it to scrub the RAM.
     pub privkey_pem: ProviderCredential, 
 }
 
