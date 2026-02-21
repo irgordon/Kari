@@ -18,10 +18,8 @@ func NewUserRepo(pool *pgxpool.Pool) *UserRepo {
 	return &UserRepo{pool: pool}
 }
 
-// HasPermission utilizes a 3-way join to verify access in a single atomic query.
+// HasPermission verifies access via indexed 3-way join.
 func (r *UserRepo) HasPermission(ctx context.Context, userID uuid.UUID, resource string, action string) (bool, error) {
-	// 🛡️ SLA: The query is structured to fail-fast. 
-	// If the user is inactive or the role lacks the perm, the result is false.
 	query := `
 		SELECT EXISTS (
 			SELECT 1 
@@ -35,17 +33,12 @@ func (r *UserRepo) HasPermission(ctx context.Context, userID uuid.UUID, resource
 			  AND p.action = $3
 		)
 	`
-
 	var exists bool
 	err := r.pool.QueryRow(ctx, query, userID, resource, action).Scan(&exists)
-	if err != nil {
-		return false, fmt.Errorf("failed to verify permissions: %w", err)
-	}
-
-	return exists, nil
+	return exists, err
 }
 
-// GetByID fetches the user and eagerly loads their role metadata.
+// GetByID fetches user + role metadata.
 func (r *UserRepo) GetByID(ctx context.Context, id uuid.UUID) (*domain.User, error) {
 	query := `
 		SELECT u.id, u.email, u.password_hash, u.is_active, u.created_at, u.updated_at,
@@ -54,7 +47,6 @@ func (r *UserRepo) GetByID(ctx context.Context, id uuid.UUID) (*domain.User, err
 		JOIN roles r ON u.role_id = r.id
 		WHERE u.id = $1
 	`
-
 	var user domain.User
 	var role domain.Role
 
@@ -69,7 +61,45 @@ func (r *UserRepo) GetByID(ctx context.Context, id uuid.UUID) (*domain.User, err
 		}
 		return nil, err
 	}
-
 	user.Role = role
 	return &user, nil
+}
+
+// 🛡️ UpdateRefreshToken persists high-entropy tokens for session rotation.
+func (r *UserRepo) UpdateRefreshToken(ctx context.Context, id uuid.UUID, token string) error {
+	query := `UPDATE users SET refresh_token = $1, updated_at = NOW() WHERE id = $2`
+	tag, err := r.pool.Exec(ctx, query, token, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+// 🛡️ GetRoleByID allows RoleService to verify ranks before assignment.
+func (r *UserRepo) GetRoleByID(ctx context.Context, id uuid.UUID) (*domain.Role, error) {
+	query := `SELECT id, name, rank FROM roles WHERE id = $1`
+	var role domain.Role
+	err := r.pool.QueryRow(ctx, query, id).Scan(&role.ID, &role.Name, &role.Rank)
+	if err == pgx.ErrNoRows {
+		return nil, domain.ErrNotFound
+	}
+	return &role, err
+}
+
+// 🛡️ CountAdmins provides a fail-fast check for the "Last Admin" protection logic.
+func (r *UserRepo) CountAdmins(ctx context.Context) (int, error) {
+	query := `SELECT COUNT(*) FROM users u JOIN roles r ON u.role_id = r.id WHERE r.rank = 0 AND u.is_active = true`
+	var count int
+	err := r.pool.QueryRow(ctx, query).Scan(&count)
+	return count, err
+}
+
+// 🛡️ UpdateUserRole handles the actual promotion/demotion after service-layer rank checks.
+func (r *UserRepo) UpdateUserRole(ctx context.Context, userID uuid.UUID, roleID uuid.UUID) error {
+	query := `UPDATE users SET role_id = $1, updated_at = NOW() WHERE id = $2`
+	_, err := r.pool.Exec(ctx, query, roleID, userID)
+	return err
 }
