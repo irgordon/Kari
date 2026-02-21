@@ -1,37 +1,42 @@
-// frontend/src/routes/(app)/+layout.server.ts
-
 import { redirect } from '@sveltejs/kit';
 import type { LayoutServerLoad } from './$types';
-
-// ==============================================================================
-// 1. The Server-Side Load Function (Gatekeeper)
-// ==============================================================================
+import { env } from '$env/dynamic/private';
 
 /**
- * The load function executes exclusively on the server during SSR, and during 
- * client-side navigation via SvelteKit's optimized fetch architecture.
- * * It relies on the `locals` object, which is securely populated by `hooks.server.ts`
- * after validating the HttpOnly `kari_access_token` against the Go API.
+ * 🛡️ Kari Panel: Server-Side Layout Orchestrator
+ * * This function serves as the second line of defense. While the Hook guards the 
+ * network boundary, this Layout ensures that the UI state is perfectly 
+ * synchronized with the verified identity in locals.
  */
 export const load: LayoutServerLoad = async ({ locals, url }) => {
-    // 1. Check if the user identity was successfully injected by the server hook
+    // 1. 🛑 Enforcement Check
+    // If hooks.server.ts failed to verify the session, we halt here.
     if (!locals.user) {
-        // Security: The user is not authenticated, or their token expired and could not be refreshed.
-        // We immediately halt rendering and force a 303 See Other redirect to the login page.
-        
-        // We also attach a `redirectTo` search parameter so the login page knows where to 
-        // send the user back to after they successfully authenticate.
-        const redirectTo = url.pathname !== '/' ? `?redirectTo=${encodeURIComponent(url.pathname)}` : '';
+        // We capture the intended destination for a seamless post-login experience.
+        const redirectTo = url.pathname !== '/' 
+            ? `?redirectTo=${encodeURIComponent(url.pathname + url.search)}` 
+            : '';
+            
         throw redirect(303, `/login${redirectTo}`);
     }
 
-    // 2. Pass the sanitized User object down to the UI
-    // By returning this object, EVERY child page (`+page.svelte`) and layout component 
-    // inside the `(app)` directory can access this user data synchronously via `data.user`.
-    // 
-    // Note: We NEVER pass the JWT tokens themselves into this return object. 
-    // The tokens remain locked in the HttpOnly cookies and the server hooks.
+    // 2. 📡 Telemetry & Metadata
+    // We provide the UI with system-level context that doesn't belong in the JWT
+    // but is required for the "Control Panel" feel.
     return {
-        user: locals.user
+        // 👤 The verified identity (ID, Role, Email)
+        user: locals.user,
+        
+        // ⚙️ System Metadata
+        meta: {
+            env: env.NODE_ENV || 'production',
+            version: '1.0.4-stable',
+            // Provide a timestamp to help the UI detect clock skew relative to the Brain
+            serverTime: new Date().toISOString()
+        },
+
+        // 🛡️ Traceability
+        // Useful for correlation if the user reports a UI error
+        layoutId: crypto.randomUUID().split('-')[0]
     };
 };
