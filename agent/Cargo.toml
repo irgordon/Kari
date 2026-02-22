@@ -1,6 +1,6 @@
 [package]
 name = "kari-agent"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024" # 🛡️ Using the 2024 edition for enhanced future-proofing
 authors = ["Kari Orchestrator Team"]
 description = "The Muscle: High-privilege Rust Agent for secure system orchestration"
