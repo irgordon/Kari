@@ -22,6 +22,10 @@ service SystemAgent {
   // 🛡️ SLA Enforcement: Server-Side Streaming for Log Backpressure
   rpc StreamDeployment(DeployRequest) returns (stream LogChunk);
 
+  // 🔥 Resource Teardown
+  rpc DeleteDeployment(DeleteRequest) returns (AgentResponse);
+  rpc TeardownJail(TeardownRequest) returns (AgentResponse);
+
   // 🛠️ Filesystem & Infrastructure
   rpc WriteSystemFile(FileWriteRequest) returns (AgentResponse);
   rpc InstallCertificate(SslPayload) returns (AgentResponse);
@@ -131,7 +135,19 @@ message DeployRequest {
   string repo_url = 4;        
   string branch = 5;          
   string build_command = 6;   
-  map<string, string> env_vars = 7; 
+  map<string, string> env_vars = 7;
+  optional int32 port = 8;    // App internal port for proxy
+  optional string ssh_key = 9; // 🛡️ Privacy: Transient SSH key
+}
+
+message DeleteRequest {
+  string app_id = 1;
+  string domain_name = 2;
+}
+
+message TeardownRequest {
+  string app_id = 1;
+  string trace_id = 2;  // Links to deployment telemetry
 }
 
 enum ServiceAction {

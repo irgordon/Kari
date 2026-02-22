@@ -2,23 +2,23 @@ package http
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"kari/api/internal/core/domain"
-	"kari/api/internal/core/services"
 	"kari/api/internal/telemetry"
 	"kari/api/internal/api/middleware"
 )
 
 type DeploymentHandler struct {
 	repo   domain.DeploymentRepository
-	crypto services.CryptoService
+	crypto domain.CryptoService
 	hub    *telemetry.Hub
 }
 
-func NewDeploymentHandler(repo domain.DeploymentRepository, crypto services.CryptoService, hub *telemetry.Hub) *DeploymentHandler {
+func NewDeploymentHandler(repo domain.DeploymentRepository, crypto domain.CryptoService, hub *telemetry.Hub) *DeploymentHandler {
 	return &DeploymentHandler{
 		repo:   repo,
 		crypto: crypto,

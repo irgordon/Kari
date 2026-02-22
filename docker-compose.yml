@@ -28,9 +28,20 @@ services:
       context: .
       dockerfile: agent/Dockerfile.dev
     container_name: kari-agent
-    privileged: true 
+    # 🛡️ Zero-Trust: Drop ALL caps, re-add only what the Muscle needs.
+    # NEVER use `privileged: true` in production.
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_ADMIN     # systemd scope management, cgroup v2 delegation
+      - NET_ADMIN      # iptables/nftables firewall policy
+      - CHOWN          # chown socket to UID 1001
+      - DAC_OVERRIDE   # Write to /etc/systemd, /etc/nginx, /etc/kari/ssl
+      - SETUID         # useradd for jail user provisioning
+      - SETGID         # group assignment for jail users
     environment:
-      - KARI_EXPECTED_API_UID=1001 
+      - KARI_API_UID=1001
+      - KARI_API_GID=1001
       - KARI_WEB_ROOT=/var/www/kari
       - KARI_SYSTEMD_DIR=/etc/systemd/system
       - RUST_LOG=info
@@ -83,7 +94,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - kari_run:/var/run/kari 
+      - kari_run:/var/run/kari
     networks:
       - backplane
       - frontend-net

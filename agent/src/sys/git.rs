@@ -83,6 +83,7 @@ impl GitManager for SystemGitManager {
             .arg("--") 
             .arg(repo_url)
             .arg(target_dir_str)
+            .kill_on_drop(true) // 🛡️ SLA: Context propagation drops the process
             .output()
             .await
             .map_err(|e| format!("SLA Failure: Git spawn error: {}", e))?;

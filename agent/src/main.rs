@@ -14,8 +14,13 @@ mod sys;
 use crate::config::AgentConfig;
 use crate::server::kari_agent::system_agent_server::SystemAgentServer;
 use crate::server::KariAgentService;
-use crate::sys::proxy::ApacheManager; // Assuming the code we wrote lives here
+
+// 🛡️ SOLID: Import trait types for discovery, concrete types for construction
 use crate::sys::traits::ProxyManager;
+use crate::sys::proxy::{ApacheManager, NginxManager};
+use crate::sys::firewall::LinuxFirewallManager;
+use crate::sys::ssl::LinuxSslEngine;
+use crate::sys::scheduler::SystemdTimerManager;
 
 /// 🛡️ SLA: Automatic Proxy Discovery
 /// Probes the host system to determine the available ingress controller.
@@ -23,8 +28,7 @@ fn discover_proxy_manager() -> Result<Arc<dyn ProxyManager>, Box<dyn std::error:
     // 1. Check for Nginx (Primary 2026 Choice)
     if Path::new("/etc/nginx/sites-available").exists() {
         info!("🔍 Discovery: Nginx detected. Initializing NginxProxyManager...");
-        // return Ok(Arc::new(NginxManager::new(PathBuf::from("/etc/nginx")))); 
-        // (Implementation following same pattern as Apache)
+        return Ok(Arc::new(NginxManager::new(PathBuf::from("/etc/nginx"))));
     }
 
     // 2. Check for Apache (Legacy/Standard Choice)
@@ -57,9 +61,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::remove_file(&socket_path)?;
     }
 
-    // 3. 🛡️ Proxy Discovery & Dependency Injection
-    // We do this BEFORE binding the socket. If the host isn't ready, we don't start.
+    // 3. 🛡️ SOLID: Dependency Discovery & Injection
+    // Each manager is discovered/constructed BEFORE the socket binds.
+    // If the host isn't ready, the Muscle refuses to start.
     let proxy_mgr = discover_proxy_manager()?;
+    let firewall_mgr = Arc::new(LinuxFirewallManager::new());
+    let ssl_engine = Arc::new(LinuxSslEngine::new(config.ssl_storage_dir.clone()));
+    let job_scheduler = Arc::new(SystemdTimerManager::new(
+        config.systemd_dir.to_string_lossy().to_string()
+    ));
 
     // 4. Bind and Secure the Socket
     let listener = UnixListener::bind(&socket_path)?;
@@ -101,7 +111,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 6. Start the Service
-    let agent_service = KariAgentService::new(config, proxy_mgr);
+    let agent_service = KariAgentService::new(
+        config,
+        proxy_mgr,
+        firewall_mgr,
+        ssl_engine,
+        job_scheduler,
+    );
     let grpc_server = Server::builder()
         .add_service(SystemAgentServer::new(agent_service))
         .serve_with_incoming(incoming_stream);

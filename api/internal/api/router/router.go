@@ -21,7 +21,9 @@ type RouterConfig struct {
 	DomainHandler  *handlers.DomainHandler
 	AuditHandler   *handlers.AuditHandler
 	WSHandler      *handlers.WebSocketHandler
+	SetupHandler   *handlers.SetupHandler
 	AuthMiddleware *auth_middleware.AuthMiddleware
+	DeployHandler  *handlers.DeploymentHandler
 	Logger         *slog.Logger
 }
 
@@ -65,6 +67,19 @@ func NewRouter(cfg RouterConfig) *chi.Mux {
 	r.Route("/api/v1", func(r chi.Router) {
 
 		// ---------------------------------------------------------------------
+		// Setup Wizard Routes (Only accessible before setup.lock exists)
+		// ---------------------------------------------------------------------
+		if cfg.SetupHandler != nil {
+			r.Route("/setup", func(r chi.Router) {
+				r.Use(cfg.SetupHandler.SetupAuth)
+				r.Get("/test-muscle", cfg.SetupHandler.TestMuscle)
+				r.Post("/test-db", cfg.SetupHandler.TestDB)
+				r.Post("/generate-key", cfg.SetupHandler.GenerateKey)
+				r.Post("/finalize", cfg.SetupHandler.Finalize)
+			})
+		}
+
+		// ---------------------------------------------------------------------
 		// Public Routes (No Auth Required)
 		// ---------------------------------------------------------------------
 		r.Group(func(r chi.Router) {
@@ -80,6 +95,27 @@ func NewRouter(cfg RouterConfig) *chi.Mux {
 		// ---------------------------------------------------------------------
 		r.Group(func(r chi.Router) {
 			r.Use(cfg.AuthMiddleware.RequireAuthentication())
+
+			// --- Mutating Method Guard (Stateless RBAC) ---
+			// 🛡️ Zero-Trust: Even if a specific route forgets a RequirePermission check,
+			// this global guard ensures view-only operators can NEVER mutate state.
+			r.Use(func(next http.Handler) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+					if req.Method == http.MethodPost || req.Method == http.MethodPut ||
+						req.Method == http.MethodDelete || req.Method == http.MethodPatch {
+						
+						// The scopes that permit mutation
+						guard := cfg.AuthMiddleware.RequireScope(
+							"domains:write", "domains:delete",
+							"applications:write", "applications:deploy", "applications:delete",
+							"server:manage",
+						)
+						guard(next).ServeHTTP(w, req)
+						return
+					}
+					next.ServeHTTP(w, req)
+				})
+			})
 
 			// --- Domains & SSL ---
 			r.Route("/domains", func(r chi.Router) {
@@ -108,6 +144,7 @@ func NewRouter(cfg RouterConfig) *chi.Mux {
 					Get("/{id}", cfg.AppHandler.GetByID)
 				
 				r.With(cfg.AuthMiddleware.RequirePermission("applications", "write")).
+					With(middleware.ValidateEnvVars).
 					Put("/{id}/env", cfg.AppHandler.UpdateEnv)
 				
 				r.With(cfg.AuthMiddleware.RequirePermission("applications", "deploy")).
@@ -123,6 +160,7 @@ func NewRouter(cfg RouterConfig) *chi.Mux {
 
 			// --- WebSocket Real-Time Terminal Streaming ---
 			r.With(cfg.AuthMiddleware.RequirePermission("applications", "read")).
+				With(middleware.ValidateTraceID("trace_id")).
 				Get("/ws/deployments/{trace_id}", cfg.WSHandler.StreamDeploymentLogs)
 		})
 	})
@@ -131,6 +169,14 @@ func NewRouter(cfg RouterConfig) *chi.Mux {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("pong"))
 	})
+
+	// 🛡️ Setup Guard: Wraps the entire router to enforce setup-first flow
+	if cfg.SetupHandler != nil {
+		guardedRouter := chi.NewRouter()
+		guardedRouter.Use(cfg.SetupHandler.SetupGuard)
+		guardedRouter.Mount("/", r)
+		return guardedRouter
+	}
 
 	return r
 }

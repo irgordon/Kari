@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -12,10 +13,11 @@ import (
 )
 
 // AESCryptoService provides high-performance AES-256-GCM authenticated encryption.
-// 🛡️ Zero-Trust: We store the hardware-accelerated cipher block, NOT the raw key bytes.
+// 🛡️ Zero-Trust: We store the hardware-accelerated AEAD interface, NOT the raw key bytes.
+// 🛡️ SOLID: This struct satisfies domain.CryptoService for dependency injection.
 type AESCryptoService struct {
 	// cipher.AEAD is inherently thread-safe for concurrent use by multiple Go routines.
-	gcm cipher.AEAD
+	aead cipher.AEAD
 }
 
 // NewAESCryptoService initializes the cipher block once during boot.
@@ -38,47 +40,62 @@ func NewAESCryptoService(hexKey string) (*AESCryptoService, error) {
 		return nil, fmt.Errorf("failed to create AES cipher block: %w", err)
 	}
 
+	// 🛡️ Privacy: Best-effort memory hygiene for the decoded key slice
+	defer func() {
+		for i := range keyBytes {
+			keyBytes[i] = 0
+		}
+	}()
+
 	aesGCM, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create GCM instance: %w", err)
 	}
 
-	return &AESCryptoService{gcm: aesGCM}, nil
+	return &AESCryptoService{aead: aesGCM}, nil
 }
 
-// Encrypt secures the plaintext and attaches a cryptographic authentication tag.
-func (s *AESCryptoService) Encrypt(plaintext []byte) (string, error) {
-	nonce := make([]byte, s.gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return "", fmt.Errorf("failed to generate cryptographic nonce: %w", err)
+// Encrypt secures the plaintext with AEAD (Authenticated Encryption with Associated Data).
+// 🛡️ Zero-Trust: The associatedData (AAD) cryptographically binds the secret to a context
+// (e.g., AppID), preventing cross-resource reuse even if the database is compromised.
+func (s *AESCryptoService) Encrypt(ctx context.Context, plaintext []byte, associatedData []byte) (string, error) {
+	nonceSize := s.aead.NonceSize()
+
+	// 🛡️ SLA: Exact capacity pre-allocation — Seal appends without reallocation
+	buf := make([]byte, nonceSize, nonceSize+len(plaintext)+s.aead.Overhead())
+
+	if _, err := io.ReadFull(rand.Reader, buf[:nonceSize]); err != nil {
+		return "", fmt.Errorf("[SLA ERROR] cryptographic nonce generation failed: %w", err)
 	}
 
 	// Seal appends the authentication tag to the ciphertext automatically.
-	// We prepend the nonce to the result so it can be extracted during decryption.
-	ciphertext := s.gcm.Seal(nonce, nonce, plaintext, nil)
-	
-	return base64.StdEncoding.EncodeToString(ciphertext), nil
+	// The AAD is included in the authentication tag but NOT encrypted.
+	ciphertext := s.aead.Seal(buf[:nonceSize], buf[:nonceSize], plaintext, associatedData)
+
+	return base64.URLEncoding.EncodeToString(ciphertext), nil
 }
 
-// Decrypt extracts the nonce, verifies the authentication tag, and decrypts the ciphertext.
-func (s *AESCryptoService) Decrypt(ciphertextBase64 string) ([]byte, error) {
-	enc, err := base64.StdEncoding.DecodeString(ciphertextBase64)
+// Decrypt extracts the nonce, verifies the AAD-bound authentication tag, and decrypts.
+// 🛡️ Zero-Trust: If the AAD does not match what was used during encryption, the
+// authentication tag verification fails and this method returns an error immediately.
+func (s *AESCryptoService) Decrypt(ctx context.Context, ciphertextBase64 string, associatedData []byte) ([]byte, error) {
+	enc, err := base64.URLEncoding.DecodeString(ciphertextBase64)
 	if err != nil {
-		return nil, errors.New("failed to decode base64 ciphertext")
+		return nil, errors.New("[SLA ERROR] failed to decode base64 ciphertext")
 	}
 
-	nonceSize := s.gcm.NonceSize()
+	nonceSize := s.aead.NonceSize()
 	if len(enc) < nonceSize {
-		return nil, errors.New("ciphertext too short: missing nonce")
+		return nil, errors.New("[SLA ERROR] ciphertext too short: missing nonce")
 	}
 
 	nonce, ciphertext := enc[:nonceSize], enc[nonceSize:]
-	
+
 	// 🛡️ Zero-Trust: Open cryptographically verifies the authentication tag BEFORE decrypting.
-	// If the database was tampered with, this will throw an error and refuse to return corrupted data.
-	plaintext, err := s.gcm.Open(nil, nonce, ciphertext, nil)
+	// If the database was tampered with, or if the AAD context doesn't match, this fails.
+	plaintext, err := s.aead.Open(nil, nonce, ciphertext, associatedData)
 	if err != nil {
-		return nil, errors.New("decryption failed: invalid key or tampered ciphertext")
+		return nil, errors.New("decryption failed: integrity violation - potential tampering detected")
 	}
 
 	return plaintext, nil

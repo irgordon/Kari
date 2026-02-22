@@ -63,11 +63,21 @@ ENV KARI_SOCKET_PATH=/var/run/kari/agent.sock
 ENV KARI_SSL_DIR=/etc/kari/ssl
 ENV RUST_LOG=info
 
-# 🛡️ The Muscle requires root for systemd/jail manipulation
+# 🛡️ The Muscle requires elevated caps for systemd/jail manipulation
+# but should NOT run with full root‐equivalent privileges.
 USER root
 
 # Create the socket directory so ownership can be managed on startup
 RUN mkdir -p /var/run/kari
 
-# Run the agent
-CMD ["kari-agent"]
+# 🛡️ Zero-Trust: Drop ALL capabilities then re-add only what we need
+# - SYS_ADMIN: systemd scope management, cgroup v2 delegation
+# - NET_ADMIN: iptables/nftables firewall policy application
+# - CHOWN: Socket + file ownership (chown kari.sock to UID 1001)
+# - DAC_OVERRIDE: Write to /etc/systemd, /etc/nginx, /etc/kari/ssl
+# - SETUID/SETGID: useradd for jail user provisioning
+# NOTE: These caps are enforced at container level via docker-compose.yml
+#       so we document them here for SOLID traceability.
+
+# Run the agent (ENTRYPOINT for proper PID 1 signal handling)
+ENTRYPOINT ["kari-agent"]

@@ -86,3 +86,37 @@ pub struct SslPayload {
 pub trait SslEngine: Send + Sync {
     async fn install_certificate(&self, payload: SslPayload) -> Result<(), String>;
 }
+
+// ==============================================================================
+// 5. Proxy Abstraction (Platform-Agnostic Ingress)
+// ==============================================================================
+
+#[async_trait]
+pub trait ProxyManager: Send + Sync {
+    /// Creates a virtual host configuration for the given domain,
+    /// proxying traffic to the specified internal port.
+    async fn create_vhost(&self, domain: &str, target_port: u16) -> Result<(), String>;
+
+    /// Removes the virtual host configuration for the given domain.
+    async fn remove_vhost(&self, domain: &str) -> Result<(), String>;
+}
+
+// ==============================================================================
+// 6. Job Scheduling Abstraction (Zero-Trust Cron)
+// ==============================================================================
+
+/// 🛡️ Zero-Trust: Discrete fields prevent shell injection via OS execve.
+pub struct JobIntent {
+    pub name: String,
+    pub binary: String,
+    pub args: Vec<String>,
+    pub schedule: String,        // Systemd OnCalendar format
+    pub run_as_user: String,
+}
+
+#[async_trait]
+pub trait JobScheduler: Send + Sync {
+    /// Schedules a recurring job using the platform's native scheduler.
+    /// 🛡️ SLA: The binary + args split prevents shell interpretation.
+    async fn schedule_job(&self, intent: &JobIntent) -> Result<(), String>;
+}

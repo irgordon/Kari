@@ -85,7 +85,12 @@ func (s *ApplicationService) Deploy(ctx context.Context, appID uuid.UUID, userID
 				})
 				break
 			}
-			logChan <- chunk.Content
+			select {
+			case logChan <- chunk.Content:
+			case <-time.After(2 * time.Second):
+				s.logger.Warn("Deployment log send timed out (slow client)", slog.String("trace_id", traceID))
+				// Optional: We can break here or just drop the log and continue
+			}
 		}
 	}()
 

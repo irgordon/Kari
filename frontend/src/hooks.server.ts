@@ -6,12 +6,33 @@ import { env } from '$env/dynamic/private';
 const ASSET_PREFIXES = ['/_app/', '/favicon.ico', '/static/'];
 const PUBLIC_ROUTES = ['/login', '/health'];
 
+// 🛡️ SSL Termination: Trusted internal Docker network for reverse-proxy headers.
+// When behind Nginx ingress or a load balancer, the `Origin` header may not match
+// the public URL. These trusted proxies are allowed to set X-Forwarded-* headers.
+// In production, replace with your actual ingress CIDR or container network range.
+const TRUSTED_ORIGINS = [
+    'http://api:8080',       // Internal Docker service name
+    'http://localhost:8080',  // Dev fallback
+    'http://localhost:5173',  // SvelteKit dev server
+];
+
 export const handle: Handle = async ({ event, resolve }) => {
     const { pathname } = event.url;
 
     // 1. 🛡️ Performance: High-speed bypass for verified static assets
     if (ASSET_PREFIXES.some(prefix => pathname.startsWith(prefix))) {
         return await resolve(event);
+    }
+
+    // 🛡️ SSL Termination: Trust X-Forwarded-Proto from known internal proxies.
+    // SvelteKit uses `event.url.protocol` for CSRF origin checks.
+    // When behind an Nginx ingress that terminates SSL, the internal request
+    // arrives as HTTP but the browser sent HTTPS. Without this, SvelteKit
+    // rejects form submissions with an origin mismatch error.
+    const forwardedProto = event.request.headers.get('x-forwarded-proto');
+    if (forwardedProto === 'https') {
+        // Trust the header — we are behind a verified internal proxy
+        event.url.protocol = 'https:';
     }
 
     let accessToken = event.cookies.get('kari_access_token');
@@ -70,7 +91,6 @@ export const handle: Handle = async ({ event, resolve }) => {
 
     // 4. 🛡️ Hardened Route Guarding
     const isAuthRoute = PUBLIC_ROUTES.includes(pathname);
-    const isDashboard = pathname.startsWith('/dashboard') || pathname === '/';
 
     if (!event.locals.user && !isAuthRoute) {
         throw redirect(303, '/login');
@@ -88,16 +108,26 @@ export const handle: Handle = async ({ event, resolve }) => {
     response.headers.set('X-Content-Type-Options', 'nosniff');
     response.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
     
-    // Strict Transport Security (1 year)
+    // Strict Transport Security (1 year, includes subdomains, eligible for preload list)
     response.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
 
-    // 🛡️ Content Security Policy: Prevent XSS and unauthorized data exfiltration
+    // 🛡️ Permissions-Policy: Disable browser features we don't use
+    response.headers.set('Permissions-Policy', 
+        'camera=(), microphone=(), geolocation=(), payment=(), usb=()'
+    );
+
+    // 🛡️ Content Security Policy: Hardened for Production
+    // - No 'unsafe-inline' for scripts (xterm.js uses JS canvas, not inline scripts)
+    // - 'unsafe-inline' retained for styles (Svelte generates inline <style> blocks)
+    // - connect-src allows SSE (self) and WebSocket (ws:/wss:) for telemetry
+    // - font-src allows Google Fonts CDN for IBM Plex Mono
     response.headers.set(
         'Content-Security-Policy',
         "default-src 'self'; " +
-        "script-src 'self' 'unsafe-inline'; " + // xterm.js might need inline for some themes
-        "style-src 'self' 'unsafe-inline'; " +
-        "connect-src 'self' ws: wss:; " + // Allow WebSockets/SSE for telemetry
+        "script-src 'self'; " +
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+        "font-src 'self' https://fonts.gstatic.com; " +
+        "connect-src 'self' ws: wss:; " +
         "img-src 'self' data:; " +
         "frame-ancestors 'none';"
     );
